@@ -1,5 +1,6 @@
 """sbi-simulator: Benchmark simulation models for Simulation-Based Inference."""
 
+from .AR1 import AR1
 from .BimodalGaussians import BimodalGaussians
 from .GaussianGaussian import GaussianGaussian
 from .LotkaVolterra import LotkaVolterra
@@ -19,16 +20,18 @@ SIMULATORS = {
     "TwoMoons": TwoMoons,
     "LotkaVolterra": LotkaVolterra,
     "UniformGaussian": UniformGaussian,
+    "AR1": AR1,
 }
 
 __all__ = [
-    "SIMULATORS",
-    "Simulator",
+    "AR1",
     "BimodalGaussians",
     "GaussianGaussian",
-    "SpikeSlab",
-    "SIR",
-    "TwoMoons",
     "LotkaVolterra",
+    "SIMULATORS",
+    "SIR",
+    "Simulator",
+    "SpikeSlab",
+    "TwoMoons",
     "UniformGaussian",
 ]

@@ -30,12 +30,12 @@ pip install .
 Add to your `flake.nix`:
 ```nix
 inputs = {
-  sbi-simulator.url = "git+https://gitlab.inria.fr/figalli/sbi-simulator.git";
+  sbi-simulator.url = "git+https://github.com/Filippo-Galli/sbi-simulators";
 };
 ```
 Or run directly:
 ```bash
-nix run git+https://gitlab.inria.fr/figalli/sbi-simulator.git
+nix run git+https://github.com/Filippo-Galli/sbi-simulators
 ```
 
 ## Usage
