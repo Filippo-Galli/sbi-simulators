@@ -15,7 +15,16 @@ buildPythonPackage (finalAttrs: {
   version = "0.1.0";
   pyproject = true;
 
-  src = lib.cleanSource ./.;
+  src = lib.fileset.toSource {
+    root = ./.;
+    fileset = lib.fileset.unions [
+      ./pyproject.toml
+      ./src
+      ./tests
+      ./LICENSE
+      ./README.md
+    ];
+  };
 
   build-system = [
     setuptools
@@ -40,7 +49,7 @@ buildPythonPackage (finalAttrs: {
 
   meta = {
     description = "Collection of simulation-based inference (SBI) benchmark simulators";
-    homepage = "https://gitlab.inria.fr/figalli/sbi-simulator";
+    homepage = "https://github.com/Filippo-Galli/sbi-simulators";
     maintainers = with lib.maintainers; [
       Filippo-Galli
     ];
