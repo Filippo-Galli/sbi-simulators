@@ -44,6 +44,6 @@ buildPythonPackage (finalAttrs: {
     maintainers = with lib.maintainers; [
       Filippo-Galli
     ];
-    license = lib.licenses.mit;
+    license = lib.licenses.gpl3Plus;
   };
 })

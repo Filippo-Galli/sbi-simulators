@@ -41,7 +41,9 @@
           pkgs = import nixpkgs { inherit system; };
         in
         {
-          default = pkgs.callPackage ./shell.nix { };
+          default = pkgs.callPackage ./shell.nix {
+            sbi-simulator = self.packages.${system}.default;
+          };
         }
       );
     };
