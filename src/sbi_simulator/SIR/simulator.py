@@ -1,204 +1,387 @@
-"""Simulator for the SIR model."""
+"""Simulator for the SIR (Susceptible-Infected-Recovered) SDE model."""
 
-import functools
 import math
 from typing import override
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pyro
 import pyro.distributions as pdist
 import torch
+
+from ..compositional import sample_two_step
+from ..mcmc import build_gibbs_pmmh_sampler, build_particle_filter_ll
 from ..Simulator import Simulator
 
 
-def _build_sir_jax_solver(
-    N: float, I0: float, R0: float, days: float, rk4_dt: float, saveat: float
+def _build_sir_step_fn(
+    dt: float = 0.01,
+    inner_steps: int = 5,
+    sigma1: float = 0.1,
 ):
-    """Build a JIT-compiled batched RK4 ODE solver in JAX."""
-    u0 = jnp.array([N - I0 - R0, I0, R0], dtype=jnp.float32)
-    dt = float(rk4_dt)
-    n_steps = round(days / dt)
-    save_every = max(round(saveat / dt), 1)
+    """Build single observation step transition function in JAX for SIR."""
 
-    def rhs(u, beta, gamma):
-        S, I, _ = u[0], u[1], u[2]
-        dS = -beta * S * I / N
-        dI = beta * S * I / N - gamma * I
+    def drift(x, gamma, beta):
+        S, I = x[0], x[1]
+        dS = -beta * S * I
+        dI = beta * S * I - gamma * I
         dR = gamma * I
         return jnp.stack([dS, dI, dR])
 
-    def solve_single(p):
-        beta, gamma = p[0], p[1]
+    def diffusion(x):
+        return jnp.array(
+            [[0.01, 0.0, 0.0], [0.0, x[1] * sigma1, 0.0], [0.0, 0.0, 0.01]]
+        )
 
-        def step_fn(u, _):
-            k1 = rhs(u, beta, gamma)
-            k2 = rhs(u + 0.5 * dt * k1, beta, gamma)
-            k3 = rhs(u + 0.5 * dt * k2, beta, gamma)
-            k4 = rhs(u + dt * k3, beta, gamma)
-            u_next = u + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-            u_next = jnp.where(
-                jnp.all(jnp.isfinite(u_next)), u_next, jnp.full_like(u_next, jnp.nan)
-            )
-            return u_next, u_next
+    def step_one(x, key, theta):
+        gamma = jax.nn.sigmoid(theta[0]) * 2.0
+        beta = jax.nn.sigmoid(theta[1]) * 2.0
+        keys = jax.random.split(key, inner_steps)
 
-        _, trajectory = jax.lax.scan(step_fn, u0, xs=None, length=n_steps)
-        full_traj = jnp.concatenate([u0[None, :], trajectory], axis=0)
-        saved = full_traj[::save_every]  # (n_save_points, 3)
-        return saved.T  # (3, n_save_points)
+        def inner_loop(i, curr_x):
+            curr_x = jnp.clip(curr_x, 0.0)
+            xdt = drift(curr_x, gamma, beta)
+            dWt = jax.random.normal(keys[i], shape=(3,)) * jnp.sqrt(dt)
+            B = diffusion(curr_x)
+            curr_x = curr_x + xdt * dt + jnp.dot(B, dWt)
+            return jnp.clip(curr_x, 0.0)
 
-    solve_batch = jax.vmap(solve_single)
-    return jax.jit(solve_batch)
+        return jax.lax.fori_loop(0, inner_steps, inner_loop, x)
+
+    return step_one
 
 
-def _build_sir_mcmc_sampler(jax_solver, N: float, total_count: int, prior_loc, prior_scale):
-    """Build a JIT-compiled parallel MCMC posterior sampler in JAX using log-space parameterization
-    and SIR (Sequential Importance Resampling) initialization to guarantee reliable convergence.
-    """
-    loc = jnp.asarray(prior_loc, dtype=jnp.float32)
-    scale = jnp.asarray(prior_scale, dtype=jnp.float32)
+def _build_sir_sde_jax_solver(step_one_fn, num_steps: int = 11):
+    """Build a JIT-compiled batched Euler-Maruyama SDE solver in JAX for SIR."""
+    default_x0 = jnp.array([4.0, 1.0, 0.0], dtype=jnp.float32)
 
-    def log_joint_eta(eta, x_obs):
-        # eta = log(theta) in R^2 (unconstrained space)
-        # Prior on eta is Normal(loc, scale^2); Jacobian cancels out with LogNormal density
-        diff = (eta - loc) / scale
-        lp_prior = -jnp.sum(0.5 * diff**2 + jnp.log(scale) + 0.5 * jnp.log(2.0 * jnp.pi))
+    def solve_single(rng_key, theta, x0=None):
+        u0 = default_x0 if x0 is None else jnp.clip(x0, 0.0)
 
-        th = jnp.exp(eta)
-        us = jax_solver(th[None, :])  # (1, 3, 161)
-        infected = us[0, 1, ::17]  # (10,)
-        probs = jnp.clip(infected / N, 1e-6, 1.0 - 1e-6)
-        k = x_obs  # (10,)
-        n = float(total_count)
-        log_comb = jax.lax.lgamma(n + 1.0) - jax.lax.lgamma(k + 1.0) - jax.lax.lgamma(n - k + 1.0)
-        ll = jnp.sum(log_comb + k * jnp.log(probs) + (n - k) * jnp.log(1.0 - probs))
-        has_nan = jnp.any(jnp.isnan(us))
-        return jnp.where(has_nan, -1e9, lp_prior + ll)
+        def one_step(x, key):
+            x_next = step_one_fn(x, key, theta)
+            return x_next, x_next
 
-    v_log_joint_eta = jax.vmap(log_joint_eta, in_axes=(0, None))
+        keys = jax.random.split(rng_key, num_steps - 1)
+        _, xs = jax.lax.scan(one_step, u0, keys)
+        full_traj = jnp.concatenate([u0[None, :], xs], axis=0)  # (num_steps, 3)
+        return full_traj.T  # (3, num_steps)
 
-    @functools.partial(jax.jit, static_argnames=["n_chains", "num_steps", "burn_in", "thin", "n_proposals"])
-    def run_mcmc(
-        x_obs,
-        rng_key,
-        n_chains: int = 50,
-        num_steps: int = 2000,
-        burn_in: int = 800,
-        thin: int = 2,
-        n_proposals: int = 5000,
-    ):
-        k_init, k_mcmc = jax.random.split(rng_key)
-        # 1. Propose candidate points from prior to find the MAP / high-density mode
-        prior_etas = loc + scale * jax.random.normal(k_init, shape=(n_proposals, 2))
-        lps = v_log_joint_eta(prior_etas, x_obs)
-        best_eta = prior_etas[jnp.argmax(lps)]
+    solve_batch_fn = jax.vmap(solve_single, in_axes=(0, 0, 0))
 
-        # 2. Initialize all parallel chains near the mode
-        k_chains, k_scan = jax.random.split(k_mcmc)
-        init_thetas_eta = best_eta + 0.02 * jax.random.normal(k_chains, shape=(n_chains, 2))
-        init_lp = v_log_joint_eta(init_thetas_eta, x_obs)
+    def solve_batch(rng_keys, thetas, x0s=None):
+        if x0s is None:
+            x0s = jnp.broadcast_to(default_x0, (thetas.shape[0], 3))
+        return solve_batch_fn(rng_keys, thetas, x0s)
 
-        # Calibrated proposal step size in log-space
-        step_size = jnp.array([0.025, 0.045], dtype=jnp.float32)
-
-        def scan_step(state, subkey):
-            curr_eta, curr_lp = state
-            k_prop, k_acc = jax.random.split(subkey)
-            prop_eta = curr_eta + jax.random.normal(k_prop, shape=(n_chains, 2)) * step_size
-            prop_lp = v_log_joint_eta(prop_eta, x_obs)
-            alpha = jnp.minimum(1.0, jnp.exp(prop_lp - curr_lp))
-            u_rand = jax.random.uniform(k_acc, shape=(n_chains,))
-            acc = u_rand < alpha
-            new_eta = jnp.where(acc[:, None], prop_eta, curr_eta)
-            new_lp = jnp.where(acc, prop_lp, curr_lp)
-            return (new_eta, new_lp), jnp.exp(new_eta)
-
-        keys = jax.random.split(k_scan, num_steps)
-        _, all_samples = jax.lax.scan(scan_step, (init_thetas_eta, init_lp), keys)
-        post_burnin = all_samples[burn_in::thin]
-        return post_burnin.reshape(-1, 2)
-
-    return run_mcmc
+    return jax.jit(solve_batch), jax.jit(solve_single)
 
 
 class SIR(Simulator):
+    """SIR (Susceptible-Infected-Recovered) Stochastic Differential Equation (SDE) simulator.
+
+    Formulation:
+        dS = -beta * S * I * dt + 0.01 * dW0
+        dI = (beta * S * I - gamma * I) * dt + sigma1 * I * dW1
+        dR = gamma * I * dt + 0.01 * dW2
+
+    Parameters:
+        theta: 2D vector [gamma, beta] in R^2 with standard normal prior N(0, I_2).
+        Mapped to positive transmission and recovery rates via:
+            gamma = 2.0 * sigmoid(theta[0]) in (0, 2.0)
+            beta  = 2.0 * sigmoid(theta[1]) in (0, 2.0)
+    """
+
     def __init__(
         self,
         dim_parameters: int = 2,
         seed: int = 42,
-        N: float = 1000000.0,
-        I0: float = 1.0,
-        R0: float = 0.0,
-        days: float = 160.0,
-        saveat: float = 1.0,
-        total_count: int = 1000,
-        summary: str | None = "subsample",
-        rk4_dt: float = 0.1,
+        dt: float = 0.01,
+        inner_steps: int = 5,
+        sigma1: float = 0.1,
+        num_steps: int = 11,
+        obs_sigma: float = 0.01,
+        summary: str | None = None,
     ):
         self.dim_parameters = dim_parameters
         if dim_parameters != 2:
-            raise ValueError(f"SIR requires dim_parameters=2 (beta, gamma), got {dim_parameters}.")
+            raise ValueError(
+                f"SIR requires dim_parameters=2 (gamma, beta), got {dim_parameters}."
+            )
 
-        self.dim_data_raw = int(3 * (days / saveat + 1))
-        if summary is None:
+        self.dt = dt
+        self.inner_steps = inner_steps
+        self.sigma1 = sigma1
+        self.num_steps = num_steps
+        self.obs_sigma = obs_sigma
+        self.dim_data_raw = int(3 * num_steps)
+
+        if summary is None or summary == "subsample":
             self.dim_data = self.dim_data_raw
-        elif summary == "subsample":
-            self.dim_data = 10
+        elif summary in ("stats", "summary_stats"):
+            self.dim_data = 15
+        elif summary == "two_step":
+            self.dim_data = 6
         else:
-            raise NotImplementedError
-        super().__init__(seed, self.dim_parameters, self.dim_data)
-
-        self.N = N
-        self.I0 = I0
-        self.R0 = R0
-        self.days = days
-        self.saveat = saveat
-        self.total_count = total_count
-        self.rk4_dt = rk4_dt
-
-        self.u0 = torch.tensor([N - I0 - R0, I0, R0])
-        self.tspan = torch.tensor([0.0, days])
-
+            raise NotImplementedError(f"Unknown summary mode: {summary}")
         self.summary = summary
 
-        # Prior distribution setup
-        self.prior_loc = [math.log(0.4), math.log(0.125)]
-        self.prior_scale = [0.5, 0.2]
-        self.prior_params = {
-            "loc": torch.tensor(self.prior_loc),
-            "scale": torch.tensor(self.prior_scale),
-        }
-        self.prior_dist = pdist.LogNormal(**self.prior_params).to_event(1)
+        super().__init__(seed, self.dim_parameters, self.dim_data)
 
-        # Build JAX solver and MCMC sampler
-        self._jax_solver = _build_sir_jax_solver(
-            N=self.N,
-            I0=self.I0,
-            R0=self.R0,
-            days=self.days,
-            rk4_dt=self.rk4_dt,
-            saveat=self.saveat,
+        self.u0 = torch.tensor([4.0, 1.0, 0.0], dtype=torch.float32)
+
+        # Prior setup: Standard Normal N(0, I_2) matching markovsbi
+        self.prior_loc = [0.0, 0.0]
+        self.prior_scale = [1.0, 1.0]
+        self.prior_dist = pdist.Normal(
+            loc=torch.zeros(2, dtype=torch.float32),
+            scale=torch.ones(2, dtype=torch.float32),
+        ).to_event(1)
+
+        # Build JAX SDE solver and Particle Filter MCMC sampler
+        self._step_fn = _build_sir_step_fn(
+            dt=self.dt,
+            inner_steps=self.inner_steps,
+            sigma1=self.sigma1,
         )
-        self._jax_mcmc = _build_sir_mcmc_sampler(
-            self._jax_solver,
-            N=self.N,
-            total_count=self.total_count,
-            prior_loc=self.prior_loc,
-            prior_scale=self.prior_scale,
+        self._jax_solver_batch, self._jax_solver_single = _build_sir_sde_jax_solver(
+            self._step_fn,
+            num_steps=self.num_steps,
+        )
+        self._pf_ll_fn = build_particle_filter_ll(
+            self._step_fn,
+            obs_dim=3,
+            obs_sigma=self.obs_sigma,
+        )
+        self._jax_mcmc = build_gibbs_pmmh_sampler(
+            self._pf_ll_fn,
+            dim_parameters=self.dim_parameters,
         )
 
-    def _solve(self, parameters: torch.Tensor) -> torch.Tensor:
-        """Batched fixed-step RK4 solver accelerated via JAX.
+    def _solve(
+        self,
+        parameters: torch.Tensor,
+        u0: torch.Tensor | None = None,
+        rng_key: jax.Array | None = None,
+    ) -> torch.Tensor:
+        """Batched SDE Euler-Maruyama simulation accelerated via JAX.
 
-        parameters: (num_samples, 2) tensor of [beta, gamma]
-        returns: (num_samples, 3, num_save_points) tensor
+        parameters: (num_samples, 2) tensor of raw thetas
+        u0: optional (num_samples, 3) tensor of initial states
+        returns: (num_samples, 3, num_steps) tensor
         """
         params_np = parameters.detach().cpu().numpy().astype(np.float32)
         params_jax = jnp.asarray(params_np)
-        res_jax = self._jax_solver(params_jax)
+        batch_size = params_jax.shape[0]
+
+        if rng_key is None:
+            rng_key = jax.random.PRNGKey(self.seed)
+        keys = jax.random.split(rng_key, batch_size)
+
+        if u0 is not None:
+            u0_np = u0.detach().cpu().numpy().astype(np.float32)
+            u0_jax = jnp.asarray(u0_np)
+            res_jax = self._jax_solver_batch(keys, params_jax, u0_jax)
+        else:
+            res_jax = self._jax_solver_batch(keys, params_jax)
+
         res_np = np.array(res_jax, copy=True)
         return torch.from_numpy(res_np)
+
+    def get_prior_x0(self) -> pdist.Distribution:
+        """Prior over initial condition x0 = [S, I, R]."""
+        return pdist.Uniform(
+            low=torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32),
+            high=torch.tensor([5.0, 5.0, 5.0], dtype=torch.float32),
+        ).to_event(1)
+
+    @staticmethod
+    def compute_summary_stats(us: torch.Tensor) -> torch.Tensor:
+        """Compute 15 summary statistics from (num_samples, 3, T) trajectory tensor.
+
+        Statistics:
+            - Mean of S, I, R (3)
+            - Log-variance of S, I, R (3)
+            - Lag-1 autocorrelation of S, I, R (3)
+            - Lag-2 autocorrelation of S, I, R (3)
+            - Pairwise cross-correlations (S-I, I-R, S-R) (3)
+        """
+        is_2d_traj = us.ndim == 2
+        if is_2d_traj:
+            us = us.unsqueeze(0)
+
+        eps = 1e-6
+        s = us[:, 0, :]
+        i = us[:, 1, :]
+        r = us[:, 2, :]
+
+        mean_s = s.mean(dim=-1, keepdim=True)
+        mean_i = i.mean(dim=-1, keepdim=True)
+        mean_r = r.mean(dim=-1, keepdim=True)
+
+        ds = s - mean_s
+        di = i - mean_i
+        dr = r - mean_r
+
+        var_s = (ds**2).mean(dim=-1, keepdim=True)
+        var_i = (di**2).mean(dim=-1, keepdim=True)
+        var_r = (dr**2).mean(dim=-1, keepdim=True)
+
+        log_var_s = torch.log(var_s.clamp_min(eps))
+        log_var_i = torch.log(var_i.clamp_min(eps))
+        log_var_r = torch.log(var_r.clamp_min(eps))
+
+        T = us.shape[-1]
+        denom_s = var_s.clamp_min(eps)
+        denom_i = var_i.clamp_min(eps)
+        denom_r = var_r.clamp_min(eps)
+
+        if T >= 2:
+            ac1_s = (ds[:, 1:] * ds[:, :-1]).mean(dim=-1, keepdim=True) / denom_s
+            ac1_i = (di[:, 1:] * di[:, :-1]).mean(dim=-1, keepdim=True) / denom_i
+            ac1_r = (dr[:, 1:] * dr[:, :-1]).mean(dim=-1, keepdim=True) / denom_r
+        else:
+            ac1_s = torch.zeros_like(mean_s)
+            ac1_i = torch.zeros_like(mean_i)
+            ac1_r = torch.zeros_like(mean_r)
+
+        if T >= 3:
+            ac2_s = (ds[:, 2:] * ds[:, :-2]).mean(dim=-1, keepdim=True) / denom_s
+            ac2_i = (di[:, 2:] * di[:, :-2]).mean(dim=-1, keepdim=True) / denom_i
+            ac2_r = (dr[:, 2:] * dr[:, :-2]).mean(dim=-1, keepdim=True) / denom_r
+        else:
+            ac2_s = torch.zeros_like(mean_s)
+            ac2_i = torch.zeros_like(mean_i)
+            ac2_r = torch.zeros_like(mean_r)
+
+        denom_si = torch.sqrt(denom_s * denom_i)
+        denom_ir = torch.sqrt(denom_i * denom_r)
+        denom_sr = torch.sqrt(denom_s * denom_r)
+
+        cc_si = (ds * di).mean(dim=-1, keepdim=True) / denom_si
+        cc_ir = (di * dr).mean(dim=-1, keepdim=True) / denom_ir
+        cc_sr = (ds * dr).mean(dim=-1, keepdim=True) / denom_sr
+
+        ac1_s = torch.nan_to_num(ac1_s.clamp(-1.0, 1.0), nan=0.0)
+        ac2_s = torch.nan_to_num(ac2_s.clamp(-1.0, 1.0), nan=0.0)
+        ac1_i = torch.nan_to_num(ac1_i.clamp(-1.0, 1.0), nan=0.0)
+        ac2_i = torch.nan_to_num(ac2_i.clamp(-1.0, 1.0), nan=0.0)
+        ac1_r = torch.nan_to_num(ac1_r.clamp(-1.0, 1.0), nan=0.0)
+        ac2_r = torch.nan_to_num(ac2_r.clamp(-1.0, 1.0), nan=0.0)
+        cc_si = torch.nan_to_num(cc_si.clamp(-1.0, 1.0), nan=0.0)
+        cc_ir = torch.nan_to_num(cc_ir.clamp(-1.0, 1.0), nan=0.0)
+        cc_sr = torch.nan_to_num(cc_sr.clamp(-1.0, 1.0), nan=0.0)
+
+        stats = torch.cat(
+            [
+                mean_s,
+                mean_i,
+                mean_r,
+                log_var_s,
+                log_var_i,
+                log_var_r,
+                ac1_s,
+                ac2_s,
+                ac1_i,
+                ac2_i,
+                ac1_r,
+                ac2_r,
+                cc_si,
+                cc_ir,
+                cc_sr,
+            ],
+            dim=-1,
+        )
+        return stats.squeeze(0) if is_2d_traj else stats
+
+    def stepper(
+        self,
+        x: torch.Tensor,
+        parameters: torch.Tensor,
+        dt: float | None = None,
+        sigma1: float | None = None,
+    ) -> torch.Tensor:
+        """Simulate a single time-series step transition for SIR SDE.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Current state [S, I, R], shape (3,) or (batch_size, 3).
+        parameters : torch.Tensor
+            SIR parameters [gamma, beta] in R^2 (raw theta or mapped rates),
+            shape (2,) or (batch_size, 2).
+        dt : float, optional
+            Step time interval (default: self.dt * self.inner_steps = 0.05).
+        sigma1 : float, optional
+            Infected diffusion level (default: self.sigma1 = 0.1).
+
+        Returns
+        -------
+        torch.Tensor
+            Next state [S, I, R] of shape (3,) or (batch_size, 3).
+        """
+        x_t = torch.as_tensor(x, dtype=torch.float32)
+        params = torch.as_tensor(parameters, dtype=torch.float32)
+
+        is_1d = x_t.ndim == 1
+        if is_1d:
+            x_t = x_t.unsqueeze(0)
+        if params.ndim == 1:
+            params = params.unsqueeze(0)
+        if params.shape[0] == 1 and x_t.shape[0] > 1:
+            params = params.expand(x_t.shape[0], -1)
+        elif x_t.shape[0] == 1 and params.shape[0] > 1:
+            x_t = x_t.expand(params.shape[0], -1)
+
+        sig1 = float(self.sigma1 if sigma1 is None else sigma1)
+
+        # Parameter mapping
+        gamma = torch.sigmoid(params[:, 0]) * 2.0
+        beta = torch.sigmoid(params[:, 1]) * 2.0
+
+        step_dt = float(self.dt * self.inner_steps if dt is None else dt)
+        sub_dt = float(self.dt)
+        n_substeps = max(round(step_dt / sub_dt), 1)
+        actual_h = step_dt / n_substeps
+
+        curr_u = torch.clamp(x_t.clone(), min=0.0)
+
+        for _ in range(n_substeps):
+            S = curr_u[:, 0]
+            I = curr_u[:, 1]
+
+            dS = -beta * S * I
+            dI = beta * S * I - gamma * I
+            dR = gamma * I
+            drift_step = torch.stack([dS, dI, dR], dim=-1)
+
+            dW = torch.randn_like(curr_u) * math.sqrt(actual_h)
+            diff_0 = 0.01 * dW[:, 0]
+            diff_1 = I * sig1 * dW[:, 1]
+            diff_2 = 0.01 * dW[:, 2]
+            diff_step = torch.stack([diff_0, diff_1, diff_2], dim=-1)
+
+            curr_u = torch.clamp(curr_u + drift_step * actual_h + diff_step, min=0.0)
+
+        return curr_u.squeeze(0) if is_1d else curr_u
+
+    def simulate_two_step(
+        self,
+        parameters: torch.Tensor,
+        x0: torch.Tensor | None = None,
+        t: int | torch.Tensor | None = None,
+        informed: bool = True,
+        return_dict: bool = False,
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        """Generate two-step transition pairs (x_t, x_{t+1}) like in markovsbi."""
+        return sample_two_step(
+            self,
+            parameters=parameters,
+            x0=x0,
+            t=t,
+            informed=informed,
+            return_dict=return_dict,
+        )
 
     @override
     def simulate(self, parameters: torch.Tensor) -> torch.Tensor:
@@ -207,25 +390,18 @@ class SIR(Simulator):
         if parameters.numel() == 0:
             raise ValueError("Expected at least one parameter.")
 
-        if parameters.ndim == 1:
+        is_1d = parameters.ndim == 1
+        if is_1d:
             parameters = parameters.unsqueeze(0)
 
         num_samples = parameters.shape[0]
 
-        us = self._solve(parameters)  # (num_samples, 3, dim_data_raw/3)
+        if self.summary == "two_step":
+            pairs = self.simulate_two_step(parameters, return_dict=False)
+            pairs_flat = pairs.reshape(num_samples, 6)
+            return pairs_flat.squeeze(0) if is_1d else pairs_flat
 
-        expected_points = int(self.dim_data_raw / 3)
-        if us.shape[-1] != expected_points:
-            if us.shape[-1] > expected_points:
-                us = us[:, :, :expected_points]
-            else:
-                pad = torch.full(
-                    (num_samples, 3, expected_points - us.shape[-1]),
-                    float("nan"),
-                    dtype=torch.float32,
-                )
-                us = torch.cat([us, pad], dim=-1)
-
+        us = self._solve(parameters)  # (num_samples, 3, num_steps)
         us = us.float()
 
         has_nan = torch.isnan(us.reshape(num_samples, -1)).any(dim=1)
@@ -233,7 +409,9 @@ class SIR(Simulator):
         idx_contains_no_nan = torch.where(~has_nan)[0]
 
         if self.summary is None:
-            return us
+            # Flatten to (num_samples, dim_data)
+            traj_flat = us.reshape(num_samples, -1)
+            return traj_flat.squeeze(0) if is_1d else traj_flat
 
         if self.summary == "subsample":
             data = torch.full(
@@ -243,20 +421,31 @@ class SIR(Simulator):
             )
 
             if len(idx_contains_nan) == num_samples:
-                return data
+                return data.squeeze(0) if is_1d else data
 
-            infected = us[:, 1, ::17].reshape(num_samples, -1)
-
-            sampled = pyro.sample(
-                "data",
-                pdist.Binomial(
-                    total_count=self.total_count,
-                    probs=(infected[idx_contains_no_nan, :] / self.N).clamp(0.0, 1.0),
-                ).to_event(1),
-            ).float()
+            # Additive Gaussian observation noise
+            raw_data = us[idx_contains_no_nan, :, :].reshape(
+                len(idx_contains_no_nan), -1
+            )
+            noise = torch.randn_like(raw_data) * self.obs_sigma
+            sampled = raw_data + noise
 
             data[idx_contains_no_nan, :] = sampled
-            return data
+            return data.squeeze(0) if is_1d else data
+
+        if self.summary in ("stats", "summary_stats"):
+            data = torch.full(
+                (num_samples, self.dim_data),
+                float("nan"),
+                dtype=torch.float32,
+            )
+
+            if len(idx_contains_nan) == num_samples:
+                return data.squeeze(0) if is_1d else data
+
+            stats = self.compute_summary_stats(us[idx_contains_no_nan, :, :])
+            data[idx_contains_no_nan, :] = stats
+            return data.squeeze(0) if is_1d else data
 
         raise ValueError(f"Unknown summary mode: {self.summary}")
 
@@ -264,73 +453,90 @@ class SIR(Simulator):
     def get_prior(self) -> pdist.Distribution:
         return self.prior_dist
 
-    def log_likelihood(self, parameters: torch.Tensor, x_obs: torch.Tensor) -> torch.Tensor:
-        """Evaluate the log-likelihood of observation x_obs under parameters.
-
-        parameters: (num_samples, 2) tensor of [beta, gamma]
-        x_obs: (10,) or (1, 10) tensor of observations
-        returns: (num_samples,) tensor of log-likelihood values
-        """
+    def log_likelihood(
+        self, parameters: torch.Tensor, x_obs: torch.Tensor, n_particles: int = 150
+    ) -> torch.Tensor:
+        """Evaluate marginal log-likelihood using JAX Particle Filter."""
         parameters = torch.as_tensor(parameters, dtype=torch.float32)
         if parameters.ndim == 1:
             parameters = parameters.unsqueeze(0)
-        x_obs = torch.as_tensor(x_obs, dtype=torch.float32).flatten()
 
-        us = self._solve(parameters)  # (num_samples, 3, dim_data_raw/3)
-        has_nan = torch.isnan(us.reshape(parameters.shape[0], -1)).any(dim=-1)
+        num_samples = parameters.shape[0]
+        x_obs_flat = torch.as_tensor(x_obs, dtype=torch.float32).flatten()
+        x_obs_2d = x_obs_flat.reshape(-1, 3)
 
-        infected = us[:, 1, ::17].reshape(parameters.shape[0], -1)
-        probs = (infected / self.N).clamp(1e-6, 1.0 - 1e-6)
+        x_jax = jnp.asarray(x_obs_2d.detach().cpu().numpy())
+        params_jax = jnp.asarray(parameters.detach().cpu().numpy())
 
-        dist = torch.distributions.Binomial(total_count=self.total_count, probs=probs)
-        ll = dist.log_prob(x_obs).sum(dim=-1)
-        ll = torch.where(has_nan, torch.tensor(-1e9, dtype=torch.float32), ll)
-        return ll
+        key = jax.random.PRNGKey(self.seed)
+        keys = jax.random.split(key, num_samples)
+
+        v_ll = jax.vmap(
+            lambda th, k: self._pf_ll_fn(th, x_jax, k, n_particles=n_particles)
+        )
+        lls_jax = v_ll(params_jax, keys)
+        return torch.from_numpy(np.array(lls_jax, copy=True))
 
     def posterior_samples(
         self,
         x_obs: torch.Tensor | np.ndarray | None = None,
         num_samples: int = 1000,
-        n_chains: int = 50,
-        burn_in: int = 800,
-        thin: int = 2,
+        n_chains: int = 20,
+        burn_in: int = 200,
+        inner_thin: int = 4,
+        n_particles: int = 150,
+        step_size: float = 0.1,
         **kwargs,
     ) -> torch.Tensor:
-        """Sample from the posterior p(theta | x_obs) for the SIR model using JAX MCMC
-        with log-space parameterization and SIR initialization.
-
-        parameters:
-            x_obs: (10,) or (1, 10) tensor observation
-            num_samples: desired number of posterior samples
-        returns:
-            (num_samples, 2) tensor of posterior parameter samples
-        """
-        if x_obs is None and "num_samples" in kwargs and isinstance(num_samples, (torch.Tensor, np.ndarray)):
+        """Sample from posterior p(theta | x_obs) using JAX Gibbs PMMH."""
+        if (
+            x_obs is None
+            and "num_samples" in kwargs
+            and isinstance(num_samples, (torch.Tensor, np.ndarray))
+        ):
             x_obs, num_samples = num_samples, kwargs.get("num_samples", 1000)
+
         if x_obs is None:
-            x_obs = torch.tensor([0.0, 1.0, 352.0, 40.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=torch.float32)
+            # Default observation generated from theta = 0 with seed 42
+            x_obs = torch.tensor(
+                [
+                    [4.0000000, 1.0000000, 0.0000000],
+                    [3.7881465, 1.1751375, 0.0533900],
+                    [3.5549567, 1.3938990, 0.1153643],
+                    [3.2974174, 1.5862643, 0.1903032],
+                    [3.0364633, 1.7333066, 0.2691698],
+                    [2.7711196, 1.9520751, 0.3586609],
+                    [2.5065825, 2.1024864, 0.4649960],
+                    [2.2470863, 2.2430851, 0.5757274],
+                    [1.9985336, 2.4134316, 0.6894845],
+                    [1.7609777, 2.6007223, 0.8086434],
+                    [1.5459836, 2.6992354, 0.9370170],
+                ],
+                dtype=torch.float32,
+            )
 
-        x_obs_flat = torch.as_tensor(x_obs, dtype=torch.float32).flatten()
-        if x_obs_flat.numel() != 10:
-            raise ValueError(f"Expected 10 elements in x_obs, got {x_obs_flat.numel()}")
+        x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
+        if x_obs_tensor.ndim == 1:
+            x_obs_2d = x_obs_tensor.reshape(-1, 3)
+        else:
+            x_obs_2d = x_obs_tensor
 
-        x_jax = jnp.asarray(x_obs_flat.detach().cpu().numpy())
+        x_jax = jnp.asarray(x_obs_2d.detach().cpu().numpy())
         rng_key = jax.random.PRNGKey(self.seed)
 
-        # Compute total steps needed to yield num_samples
-        steps_needed = math.ceil(num_samples / n_chains) * thin
-        total_steps = burn_in + max(steps_needed, 500 * thin)
+        num_samples_per_chain = math.ceil(num_samples / n_chains)
 
         samples_jax = self._jax_mcmc(
             x_jax,
             rng_key,
             n_chains=n_chains,
-            num_steps=total_steps,
+            num_samples_per_chain=num_samples_per_chain,
             burn_in=burn_in,
-            thin=thin,
+            inner_thin=inner_thin,
+            n_particles=n_particles,
+            step_size=step_size,
         )
         samples_np = np.array(samples_jax, copy=True)
-        # Randomly shuffle across chains/time to get i.i.d. draws
         np.random.shuffle(samples_np)
         samples_torch = torch.from_numpy(samples_np)
         return samples_torch[:num_samples]
