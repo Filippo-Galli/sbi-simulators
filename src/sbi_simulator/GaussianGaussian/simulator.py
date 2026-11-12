@@ -6,6 +6,7 @@ from typing import override
 
 import pyro.distributions as pdist
 import torch
+
 from ..Simulator import Simulator
 
 
@@ -64,7 +65,11 @@ class GaussianGaussian(Simulator):
             Sigma_post = (I + N * Sigma^-1)^-1
             mu_post    = Sigma_post @ Sigma^-1 @ sum_{i=1}^N x_i
         """
-        if x_obs is None and "num_samples" in kwargs and isinstance(num_samples, torch.Tensor):
+        if (
+            x_obs is None
+            and "num_samples" in kwargs
+            and isinstance(num_samples, torch.Tensor)
+        ):
             x_obs, num_samples = num_samples, kwargs.get("num_samples", 1000)
         if x_obs is None:
             x_obs = torch.zeros(self.dim_data, dtype=torch.float32)

@@ -1,8 +1,9 @@
 from typing import override
 
 import torch
-from ..Simulator import Simulator
 from pyro import distributions as pdist
+
+from ..Simulator import Simulator
 
 
 class BimodalGaussians(Simulator):
@@ -37,7 +38,9 @@ class BimodalGaussians(Simulator):
 
         batch_size = params.shape[0]
         # Single sign per simulation sample (bimodal: mode 1 vs mode 2 across all dimensions)
-        signs = torch.where(torch.rand((batch_size, 1), device=params.device) < 0.5, 1.0, -1.0)
+        signs = torch.where(
+            torch.rand((batch_size, 1), device=params.device) < 0.5, 1.0, -1.0
+        )
         out = params + signs * self.shift + self.sigma * torch.randn_like(params)
         return out.squeeze(0) if is_1d else out
 
@@ -51,7 +54,11 @@ class BimodalGaussians(Simulator):
         For an observation x_obs, the posterior is a symmetric mixture of two Gaussians
         centered at x_obs - shift and x_obs + shift, truncated to [-10, 10]^d.
         """
-        if x_obs is None and "num_samples" in kwargs and isinstance(num_samples, torch.Tensor):
+        if (
+            x_obs is None
+            and "num_samples" in kwargs
+            and isinstance(num_samples, torch.Tensor)
+        ):
             x_obs, num_samples = num_samples, kwargs.get("num_samples", 1000)
         if x_obs is None:
             x_obs = torch.zeros(self.dim_data, dtype=torch.float32)

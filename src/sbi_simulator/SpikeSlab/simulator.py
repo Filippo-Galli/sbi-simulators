@@ -5,6 +5,7 @@ from typing import override
 import numpy as np
 import pyro.distributions as pdist
 import torch
+
 from ..Simulator import Simulator
 
 
@@ -55,7 +56,11 @@ class SpikeSlab(Simulator):
             p(x|theta) = 0.5 N(x; theta, I) + 0.5 N(x; theta, 0.01 I),
             p(theta|x) ∝ [0.5 N(theta; x, I) + 0.5 N(theta; x, 0.01 I)] * I(theta in [-10, 10]^D).
         """
-        if x_obs is None and "num_samples" in kwargs and isinstance(num_samples, (torch.Tensor, np.ndarray)):
+        if (
+            x_obs is None
+            and "num_samples" in kwargs
+            and isinstance(num_samples, (torch.Tensor, np.ndarray))
+        ):
             x_obs, num_samples = num_samples, kwargs.get("num_samples", 1000)
         if x_obs is None:
             x_obs = torch.zeros(self.dim_data, dtype=torch.float32)
@@ -99,10 +104,14 @@ class SpikeSlab(Simulator):
             ll_per_obs = torch.logsumexp(ll_comp + np.log(0.5), dim=-1)  # (K, n_obs)
             total_ll = ll_per_obs.sum(dim=-1)  # (K,)
             in_prior = torch.all((th >= lo) & (th <= hi), dim=-1)
-            return torch.where(in_prior, total_ll, torch.tensor(-1e9, dtype=torch.float32))
+            return torch.where(
+                in_prior, total_ll, torch.tensor(-1e9, dtype=torch.float32)
+            )
 
         # Vectorized MCMC in unconstrained space with sigmoid mapping
-        current = x_obs_t.mean(dim=0).unsqueeze(0).repeat(50, 1) + 0.1 * torch.randn(50, d)
+        current = x_obs_t.mean(dim=0).unsqueeze(0).repeat(50, 1) + 0.1 * torch.randn(
+            50, d
+        )
         current = current.clamp(lo + 0.1, hi - 0.1)
         current_lp = log_joint(current)
         step_size = 0.05 / np.sqrt(n_obs)

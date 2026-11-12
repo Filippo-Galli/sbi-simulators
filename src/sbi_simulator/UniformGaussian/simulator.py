@@ -140,7 +140,11 @@ class UniformGaussian(Simulator):
         Returns:
             torch.Tensor of shape (num_samples, dim_parameters).
         """
-        if x_obs is None and "num_samples" in kwargs and isinstance(num_samples, (torch.Tensor, np.ndarray)):
+        if (
+            x_obs is None
+            and "num_samples" in kwargs
+            and isinstance(num_samples, (torch.Tensor, np.ndarray))
+        ):
             x_obs, num_samples = num_samples, kwargs.get("num_samples", 1000)
         if x_obs is None:
             x_obs_t = self.default_x_obs.unsqueeze(0)
@@ -170,7 +174,9 @@ class UniformGaussian(Simulator):
             attempts += 1
             needed = num_samples - collected
             batch_size = max(needed * 2, 1000)
-            candidates = x_mean + effective_sigma * torch.randn(batch_size, d, dtype=torch.float32)
+            candidates = x_mean + effective_sigma * torch.randn(
+                batch_size, d, dtype=torch.float32
+            )
             mask = torch.all((candidates >= -L) & (candidates <= L), dim=-1)
             accepted = candidates[mask]
             if accepted.numel() > 0:
@@ -187,7 +193,9 @@ class UniformGaussian(Simulator):
         x_np = x_mean.cpu().numpy()
         a = (-L - x_np) / effective_sigma
         b = (L - x_np) / effective_sigma
-        fallback_samples = stats.truncnorm.rvs(a, b, loc=x_np, scale=effective_sigma, size=(remaining, d))
+        fallback_samples = stats.truncnorm.rvs(
+            a, b, loc=x_np, scale=effective_sigma, size=(remaining, d)
+        )
         fallback_t = torch.as_tensor(fallback_samples, dtype=torch.float32)
         if samples_list:
             return torch.cat([torch.cat(samples_list, dim=0), fallback_t], dim=0)
