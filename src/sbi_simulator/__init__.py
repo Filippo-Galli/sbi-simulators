@@ -5,6 +5,7 @@ from .BimodalGaussians import BimodalGaussians
 from .compositional import extract_two_step_pairs, sample_two_step
 from .DoubleWell import DoubleWell
 from .GaussianGaussian import GaussianGaussian
+from .LinearSDE import LinearSDE
 from .LotkaVolterra import LotkaVolterra
 from .Simulator import Simulator
 from .SIR import SIR
@@ -19,6 +20,7 @@ SIMULATORS = {
     "BimodalGaussians": BimodalGaussians,
     "DoubleWell": DoubleWell,
     "GaussianGaussian": GaussianGaussian,
+    "LinearSDE": LinearSDE,
     "SpikeSlab": SpikeSlab,
     "SIR": SIR,
     "SLCP": SLCP,
@@ -36,6 +38,7 @@ __all__ = [
     "BimodalGaussians",
     "DoubleWell",
     "GaussianGaussian",
+    "LinearSDE",
     "LotkaVolterra",
     "Simulator",
     "SpikeSlab",
