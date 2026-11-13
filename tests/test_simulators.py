@@ -8,6 +8,7 @@ from sbi_simulator import SIMULATORS, Simulator
 EXPECTED_SIMULATORS = [
     "TwoMoons",
     "BimodalGaussians",
+    "DoubleWell",
     "GaussianGaussian",
     "SpikeSlab",
     "SIR",
@@ -148,6 +149,12 @@ def test_analytic_posterior_samplers():
     samples_lv = lv.posterior_samples(num_samples=num_samples)
     assert samples_lv.shape == (num_samples, 4)
     assert torch.isfinite(samples_lv).all()
+
+    # DoubleWell
+    dw = SIMULATORS["DoubleWell"](seed=42)
+    samples_dw = dw.posterior_samples(num_samples=num_samples, n_chains=2, burn_in=10, inner_thin=1, n_particles=50)
+    assert samples_dw.shape == (num_samples, 2)
+    assert torch.isfinite(samples_dw).all()
 
     # SLCP
     slcp = SIMULATORS["SLCP"](seed=42)
@@ -420,3 +427,66 @@ def test_slcp_two_step_generator():
     x_next = slcp.stepper(x_curr, params_stepper)
     assert x_next.shape == (2, 2)
     assert torch.isfinite(x_next).all()
+
+
+def test_double_well_summary_stats():
+    """Verify DoubleWell with summary='stats' computes 16 statistics."""
+    dw = SIMULATORS["DoubleWell"](summary="stats", seed=42)
+    assert dw.dim_parameters == 2
+    assert dw.dim_data == 16  # 4 stats * 4 dims
+
+    prior = dw.get_prior()
+    theta_1d = prior.sample()
+    out_1d = dw.simulate(theta_1d)
+    assert out_1d.shape == (16,)
+    assert torch.isfinite(out_1d).all()
+
+    thetas_batch = prior.sample((4,))
+    out_batch = dw.simulate(thetas_batch)
+    assert out_batch.shape == (4, 16)
+    assert torch.isfinite(out_batch).all()
+
+
+def test_double_well_two_step_generator():
+    """Verify DoubleWell as time series two step generator."""
+    dw = SIMULATORS["DoubleWell"](summary="two_step", seed=42)
+    assert dw.dim_parameters == 2
+    assert dw.dim_data == 8  # 2 * D
+
+    prior = dw.get_prior()
+    thetas = prior.sample((5,))
+
+    # 1. Standard simulate() returning flattened (5, 8)
+    x = dw.simulate(thetas)
+    assert x.shape == (5, 8)
+    assert torch.isfinite(x).all()
+
+    # 2. 1D input returning (8,)
+    x_1d = dw.simulate(thetas[0])
+    assert x_1d.shape == (8,)
+    assert torch.isfinite(x_1d).all()
+
+    # 3. simulate_two_step returning (5, 2, 4)
+    pairs = dw.simulate_two_step(thetas, informed=True, return_dict=False)
+    assert pairs.shape == (5, 2, 4)
+    assert torch.isfinite(pairs).all()
+
+    # 4. simulate_two_step with return_dict=True
+    data_dict = dw.simulate_two_step(thetas, informed=True, return_dict=True)
+    assert (
+        "thetas" in data_dict
+        and "xs" in data_dict
+        and "ts" in data_dict
+        and "x0s" in data_dict
+    )
+    assert data_dict["xs"].shape == (5, 2, 4)
+    assert data_dict["ts"].shape == (5,)
+
+    # 5. Stepper method
+    x_curr = torch.zeros(2, 4)
+    params_stepper = thetas[:2]
+    x_next = dw.stepper(x_curr, params_stepper)
+    assert x_next.shape == (2, 4)
+    assert torch.isfinite(x_next).all()
+
+

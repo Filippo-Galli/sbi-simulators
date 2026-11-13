@@ -3,6 +3,7 @@
 from .AR1 import AR1
 from .BimodalGaussians import BimodalGaussians
 from .compositional import extract_two_step_pairs, sample_two_step
+from .DoubleWell import DoubleWell
 from .GaussianGaussian import GaussianGaussian
 from .LotkaVolterra import LotkaVolterra
 from .Simulator import Simulator
@@ -16,6 +17,7 @@ __version__ = "0.1.0"
 
 SIMULATORS = {
     "BimodalGaussians": BimodalGaussians,
+    "DoubleWell": DoubleWell,
     "GaussianGaussian": GaussianGaussian,
     "SpikeSlab": SpikeSlab,
     "SIR": SIR,
@@ -28,12 +30,13 @@ SIMULATORS = {
 
 __all__ = [
     "AR1",
-    "BimodalGaussians",
-    "GaussianGaussian",
-    "LotkaVolterra",
     "SIMULATORS",
     "SIR",
     "SLCP",
+    "BimodalGaussians",
+    "DoubleWell",
+    "GaussianGaussian",
+    "LotkaVolterra",
     "Simulator",
     "SpikeSlab",
     "TwoMoons",
