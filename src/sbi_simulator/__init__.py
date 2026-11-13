@@ -7,6 +7,7 @@ from .GaussianGaussian import GaussianGaussian
 from .LotkaVolterra import LotkaVolterra
 from .Simulator import Simulator
 from .SIR import SIR
+from .SLCP import SLCP
 from .SpikeSlab import SpikeSlab
 from .TwoMoons import TwoMoons
 from .UniformGaussian import UniformGaussian
@@ -18,6 +19,7 @@ SIMULATORS = {
     "GaussianGaussian": GaussianGaussian,
     "SpikeSlab": SpikeSlab,
     "SIR": SIR,
+    "SLCP": SLCP,
     "TwoMoons": TwoMoons,
     "LotkaVolterra": LotkaVolterra,
     "UniformGaussian": UniformGaussian,
@@ -26,11 +28,12 @@ SIMULATORS = {
 
 __all__ = [
     "AR1",
-    "SIMULATORS",
-    "SIR",
     "BimodalGaussians",
     "GaussianGaussian",
     "LotkaVolterra",
+    "SIMULATORS",
+    "SIR",
+    "SLCP",
     "Simulator",
     "SpikeSlab",
     "TwoMoons",
@@ -38,3 +41,4 @@ __all__ = [
     "extract_two_step_pairs",
     "sample_two_step",
 ]
+

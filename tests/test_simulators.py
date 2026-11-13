@@ -11,6 +11,7 @@ EXPECTED_SIMULATORS = [
     "GaussianGaussian",
     "SpikeSlab",
     "SIR",
+    "SLCP",
     "LotkaVolterra",
     "UniformGaussian",
 ]
@@ -148,6 +149,13 @@ def test_analytic_posterior_samplers():
     assert samples_lv.shape == (num_samples, 4)
     assert torch.isfinite(samples_lv).all()
 
+    # SLCP
+    slcp = SIMULATORS["SLCP"](seed=42)
+    samples_slcp = slcp.posterior_samples(num_samples=num_samples)
+    assert samples_slcp.shape == (num_samples, 5)
+    assert torch.isfinite(samples_slcp).all()
+    assert (samples_slcp >= -3.0).all() and (samples_slcp <= 3.0).all()
+
 
 def test_posterior_distribution_accuracy():
     """Verify that posterior samples accurately reflect true posterior distributions."""
@@ -192,6 +200,12 @@ def test_posterior_distribution_accuracy():
     samples_lv = lv.posterior_samples(num_samples=500)
     expected_lv_mean = torch.tensor([-0.4081, -0.8585, -0.0750, 0.2163])
     assert torch.allclose(samples_lv.mean(dim=0), expected_lv_mean, atol=0.08)
+
+    # 7. SLCP posterior accuracy on benchmark observation 1
+    slcp = SIMULATORS["SLCP"](seed=42)
+    samples_slcp = slcp.posterior_samples(num_samples=500)
+    expected_slcp_mean = torch.tensor([0.5022, 0.0757, 0.9482, -0.1026, 2.3475])
+    assert torch.allclose(samples_slcp.mean(dim=0), expected_slcp_mean, atol=0.20)
 
 
 def test_simulator_invalid_inputs():
@@ -345,3 +359,64 @@ def test_sir_two_step_generator():
     x0_samples = prior_x0.sample((10,))
     assert x0_samples.shape == (10, 3)
     assert (x0_samples >= 0.0).all()
+
+
+def test_slcp_summary_stats():
+    """Verify SLCP with summary stats mode."""
+    slcp = SIMULATORS["SLCP"](summary="stats", seed=42)
+    assert slcp.dim_parameters == 5
+    assert slcp.dim_data == 5
+
+    prior = slcp.get_prior()
+    theta_1d = prior.sample()
+    out_1d = slcp.simulate(theta_1d)
+    assert out_1d.shape == (5,)
+    assert torch.isfinite(out_1d).all()
+
+    thetas_batch = prior.sample((4,))
+    out_batch = slcp.simulate(thetas_batch)
+    assert out_batch.shape == (4, 5)
+    assert torch.isfinite(out_batch).all()
+
+
+def test_slcp_two_step_generator():
+    """Verify SLCP as time series two step generator."""
+    slcp = SIMULATORS["SLCP"](summary="two_step", seed=42)
+    assert slcp.dim_parameters == 5
+    assert slcp.dim_data == 4
+
+    prior = slcp.get_prior()
+    thetas = prior.sample((5,))
+
+    # 1. Standard simulate() returning flattened (5, 4)
+    x = slcp.simulate(thetas)
+    assert x.shape == (5, 4)
+    assert torch.isfinite(x).all()
+
+    # 2. 1D input returning (4,)
+    x_1d = slcp.simulate(thetas[0])
+    assert x_1d.shape == (4,)
+    assert torch.isfinite(x_1d).all()
+
+    # 3. simulate_two_step returning (5, 2, 2)
+    pairs = slcp.simulate_two_step(thetas, informed=True, return_dict=False)
+    assert pairs.shape == (5, 2, 2)
+    assert torch.isfinite(pairs).all()
+
+    # 4. simulate_two_step with return_dict=True
+    data_dict = slcp.simulate_two_step(thetas, informed=True, return_dict=True)
+    assert (
+        "thetas" in data_dict
+        and "xs" in data_dict
+        and "ts" in data_dict
+        and "x0s" in data_dict
+    )
+    assert data_dict["xs"].shape == (5, 2, 2)
+    assert data_dict["ts"].shape == (5,)
+
+    # 5. Stepper method
+    x_curr = torch.tensor([[0.0, 0.0], [1.0, -1.0]])
+    params_stepper = thetas[:2]
+    x_next = slcp.stepper(x_curr, params_stepper)
+    assert x_next.shape == (2, 2)
+    assert torch.isfinite(x_next).all()
