@@ -9,14 +9,16 @@ A Python library of benchmark simulation models for Simulation-Based Inference (
   - `BimodalGaussians`
   - `GaussianGaussian`
   - `SpikeSlab`
-  - `SIR` (JAX RK4 solver & MCMC posterior sampling)
-  - `LotkaVolterra` (JAX RK4 solver & MCMC posterior sampling)
+  - `SIR` 
+  - `LotkaVolterra` 
   - `UniformGaussian`
+  - `SLCP`
+  - `LinearSDE`
+  - `doubleWell`
 - **Standardized API**:
   - Base `Simulator` class with `simulate(parameters)` and `get_prior()`.
   - Analytic or reference `posterior_samples(x_obs, num_samples)` for ground truth evaluation.
   - Batched simulation and configurable dimensions where supported.
-- **Lazy loading**: Simulators are dynamically loaded on access to prevent heavy initialization overhead.
 - **Nix-ready**: Packaged with Nix flake and `package.nix` for declarative builds and environments.
 
 ## Installation
