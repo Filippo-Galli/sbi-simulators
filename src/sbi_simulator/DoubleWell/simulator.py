@@ -379,8 +379,13 @@ class DoubleWell(Simulator):
             parameters = parameters.unsqueeze(0)
 
         num_samples = parameters.shape[0]
-        x_obs_flat = torch.as_tensor(x_obs, dtype=torch.float32).flatten()
-        x_obs_2d = x_obs_flat.reshape(-1, self.D)
+        x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
+        if x_obs_tensor.ndim == 1:
+            x_obs_2d = x_obs_tensor.reshape(self.D, -1).T
+        elif x_obs_tensor.ndim == 2 and x_obs_tensor.shape == (self.D, self.num_steps):
+            x_obs_2d = x_obs_tensor.T
+        else:
+            x_obs_2d = x_obs_tensor
 
         x_jax = jnp.asarray(x_obs_2d.detach().cpu().numpy())
         params_jax = jnp.asarray(parameters.detach().cpu().numpy())
@@ -434,8 +439,14 @@ class DoubleWell(Simulator):
 
         if isinstance(x_obs, np.ndarray):
             x_obs = torch.from_numpy(x_obs).float()
-        x_obs = x_obs.flatten().reshape(-1, self.D)
-        x_obs_jax = jnp.asarray(x_obs.detach().cpu().numpy().astype(np.float32))
+        x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
+        if x_obs_tensor.ndim == 1:
+            x_obs_2d = x_obs_tensor.reshape(self.D, -1).T
+        elif x_obs_tensor.ndim == 2 and x_obs_tensor.shape == (self.D, self.num_steps):
+            x_obs_2d = x_obs_tensor.T
+        else:
+            x_obs_2d = x_obs_tensor
+        x_obs_jax = jnp.asarray(x_obs_2d.detach().cpu().numpy().astype(np.float32))
 
         num_samples_per_chain = math.ceil(num_samples / n_chains)
 

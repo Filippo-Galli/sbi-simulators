@@ -431,8 +431,13 @@ class LotkaVolterra(Simulator):
             parameters = parameters.unsqueeze(0)
 
         num_samples = parameters.shape[0]
-        x_obs_flat = torch.as_tensor(x_obs, dtype=torch.float32).flatten()
-        x_obs_2d = x_obs_flat.reshape(-1, 2)
+        x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
+        if x_obs_tensor.ndim == 1:
+            x_obs_2d = x_obs_tensor.reshape(2, -1).T
+        elif x_obs_tensor.ndim == 2 and x_obs_tensor.shape == (2, self.num_steps):
+            x_obs_2d = x_obs_tensor.T
+        else:
+            x_obs_2d = x_obs_tensor
 
         x_jax = jnp.asarray(x_obs_2d.detach().cpu().numpy())
         params_jax = jnp.asarray(parameters.detach().cpu().numpy())
@@ -486,7 +491,9 @@ class LotkaVolterra(Simulator):
 
         x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
         if x_obs_tensor.ndim == 1:
-            x_obs_2d = x_obs_tensor.reshape(-1, 2)
+            x_obs_2d = x_obs_tensor.reshape(2, -1).T
+        elif x_obs_tensor.ndim == 2 and x_obs_tensor.shape == (2, self.num_steps):
+            x_obs_2d = x_obs_tensor.T
         else:
             x_obs_2d = x_obs_tensor
 

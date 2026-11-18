@@ -175,6 +175,63 @@ def test_analytic_posterior_samplers():
     assert (samples_slcp >= -3.0).all() and (samples_slcp <= 3.0).all()
 
 
+def test_sde_simulators_with_1d_simulated_x_obs():
+    """Verify that multi-dimensional SDE posterior samplers work when passed 1D x_obs from simulate()."""
+    num_samples = 10
+
+    # LotkaVolterra (dim=4, states=2, num_steps=11)
+    lv = SIMULATORS["LotkaVolterra"](seed=42)
+    th_lv = torch.zeros(4)
+    x_1d_lv = lv.simulate(th_lv)
+    assert x_1d_lv.ndim == 1
+    ll_lv = lv.log_likelihood(th_lv, x_1d_lv)
+    assert torch.isfinite(ll_lv).all() and ll_lv.item() > -100.0
+    samples_lv = lv.posterior_samples(
+        x_obs=x_1d_lv, num_samples=num_samples, n_chains=2, burn_in=10, inner_thin=1, n_particles=50
+    )
+    assert samples_lv.shape == (num_samples, 4)
+    assert torch.isfinite(samples_lv).all()
+
+    # SIR (dim=2, states=3, num_steps=11)
+    sir = SIMULATORS["SIR"](seed=42)
+    th_sir = torch.zeros(2)
+    x_1d_sir = sir.simulate(th_sir)
+    assert x_1d_sir.ndim == 1
+    ll_sir = sir.log_likelihood(th_sir, x_1d_sir)
+    assert torch.isfinite(ll_sir).all() and ll_sir.item() > -100.0
+    samples_sir = sir.posterior_samples(
+        x_obs=x_1d_sir, num_samples=num_samples, n_chains=2, burn_in=10, inner_thin=1, n_particles=50
+    )
+    assert samples_sir.shape == (num_samples, 2)
+    assert torch.isfinite(samples_sir).all()
+
+    # DoubleWell (dim=2, states=4, num_steps=11)
+    dw = SIMULATORS["DoubleWell"](seed=42)
+    th_dw = torch.zeros(2)
+    x_1d_dw = dw.simulate(th_dw)
+    assert x_1d_dw.ndim == 1
+    ll_dw = dw.log_likelihood(th_dw, x_1d_dw)
+    assert torch.isfinite(ll_dw).all() and ll_dw.item() > -100.0
+    samples_dw = dw.posterior_samples(
+        x_obs=x_1d_dw, num_samples=num_samples, n_chains=2, burn_in=10, inner_thin=1, n_particles=50
+    )
+    assert samples_dw.shape == (num_samples, 2)
+    assert torch.isfinite(samples_dw).all()
+
+    # LinearSDE (dim=2, states=2, num_steps=11)
+    lsde = SIMULATORS["LinearSDE"](seed=42)
+    th_lsde = torch.zeros(2)
+    x_1d_lsde = lsde.simulate(th_lsde)
+    assert x_1d_lsde.ndim == 1
+    ll_lsde = lsde.log_likelihood(th_lsde, x_1d_lsde)
+    assert torch.isfinite(ll_lsde).all() and ll_lsde.item() > -100.0
+    samples_lsde = lsde.posterior_samples(
+        x_obs=x_1d_lsde, num_samples=num_samples, n_chains=2, burn_in=10
+    )
+    assert samples_lsde.shape == (num_samples, 2)
+    assert torch.isfinite(samples_lsde).all()
+
+
 def test_posterior_distribution_accuracy():
     """Verify that posterior samples accurately reflect true posterior distributions."""
     # 1. GaussianGaussian exact analytical posterior mean and variance
