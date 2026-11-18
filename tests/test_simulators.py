@@ -153,13 +153,17 @@ def test_analytic_posterior_samplers():
 
     # DoubleWell
     dw = SIMULATORS["DoubleWell"](seed=42)
-    samples_dw = dw.posterior_samples(num_samples=num_samples, n_chains=2, burn_in=10, inner_thin=1, n_particles=50)
+    samples_dw = dw.posterior_samples(
+        num_samples=num_samples, n_chains=2, burn_in=10, inner_thin=1, n_particles=50
+    )
     assert samples_dw.shape == (num_samples, 2)
     assert torch.isfinite(samples_dw).all()
 
     # LinearSDE
     lsde = SIMULATORS["LinearSDE"](seed=42)
-    samples_lsde = lsde.posterior_samples(num_samples=num_samples, n_chains=2, burn_in=10)
+    samples_lsde = lsde.posterior_samples(
+        num_samples=num_samples, n_chains=2, burn_in=10
+    )
     assert samples_lsde.shape == (num_samples, 2)
     assert torch.isfinite(samples_lsde).all()
 
@@ -205,21 +209,21 @@ def test_posterior_distribution_accuracy():
 
     # 5. SIR SDE posterior accuracy on benchmark observation
     sir = SIMULATORS["SIR"](seed=42)
-    samples_sir = sir.posterior_samples(num_samples=500)
+    samples_sir = sir.posterior_samples(num_samples=2000)
     expected_sir_mean = torch.tensor([-0.0034, 0.0000])
     assert torch.allclose(samples_sir.mean(dim=0), expected_sir_mean, atol=0.05)
 
     # 6. LotkaVolterra SDE posterior accuracy on benchmark observation
     lv = SIMULATORS["LotkaVolterra"](seed=42)
-    samples_lv = lv.posterior_samples(num_samples=500)
-    expected_lv_mean = torch.tensor([-0.4081, -0.8585, -0.0750, 0.2163])
+    samples_lv = lv.posterior_samples(num_samples=2000)
+    expected_lv_mean = torch.tensor([-0.3667, -0.7719, -0.2398, 0.1093])
     assert torch.allclose(samples_lv.mean(dim=0), expected_lv_mean, atol=0.08)
 
     # 7. SLCP posterior accuracy on benchmark observation 1
     slcp = SIMULATORS["SLCP"](seed=42)
-    samples_slcp = slcp.posterior_samples(num_samples=500)
+    samples_slcp = slcp.posterior_samples(num_samples=2000)
     expected_slcp_mean = torch.tensor([0.5022, 0.0757, 0.9482, -0.1026, 2.3475])
-    assert torch.allclose(samples_slcp.mean(dim=0), expected_slcp_mean, atol=0.20)
+    assert torch.allclose(samples_slcp.mean(dim=0), expected_slcp_mean, atol=0.08)
 
 
 def test_simulator_invalid_inputs():
@@ -575,6 +579,3 @@ def test_linear_sde_variants():
     th_g = g_sde.get_prior().sample((3,))
     x_g = g_sde.simulate(th_g)
     assert x_g.shape == (3, 22)
-
-
-
