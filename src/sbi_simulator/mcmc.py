@@ -174,3 +174,125 @@ def build_gibbs_pmmh_sampler(
         return post_burnin.transpose(1, 0, 2).reshape(-1, dim_parameters)
 
     return run_mcmc
+
+
+def build_ode_ll(
+    solve_single_fn,
+    obs_dim: int,
+    num_steps: int,
+    obs_sigma: float = 0.05,
+):
+    """Build a JIT-compiled exact Gaussian observation log-likelihood for deterministic ODE models.
+
+    Parameters
+    ----------
+    solve_single_fn : callable
+        Function `(dummy_key, theta, x0)` returning trajectory of shape `(obs_dim, num_steps)`.
+    obs_dim : int
+        Dimensionality of state / observation vector.
+    num_steps : int
+        Number of time steps.
+    obs_sigma : float
+        Standard deviation of additive Gaussian observation noise.
+    """
+    log_norm_const = obs_dim * jnp.log(obs_sigma) + (obs_dim / 2.0) * jnp.log(
+        2.0 * jnp.pi
+    )
+    dummy_key = jax.random.PRNGKey(0)
+
+    def ode_ll(theta, x_obs):
+        u0 = x_obs[0]
+        traj = solve_single_fn(dummy_key, theta, u0).T  # (num_steps, obs_dim)
+        diff = (traj[1:] - x_obs[1:]) / obs_sigma
+        log_p = -0.5 * jnp.sum(diff**2, axis=-1) - log_norm_const
+        ll = jnp.sum(log_p)
+        has_nan = jnp.isnan(ll)
+        return jnp.where(has_nan, -1e9, ll)
+
+    return jax.jit(ode_ll)
+
+
+def build_ode_mcmc_sampler(
+    ode_ll_fn,
+    dim_parameters: int,
+):
+    """Build a JIT-compiled Metropolis-Hastings MCMC sampler in JAX for ODE models.
+
+    Parameters
+    ----------
+    ode_ll_fn : callable
+        Function `(theta, x_obs)` returning the scalar log-likelihood.
+    dim_parameters : int
+        Dimensionality of theta.
+    """
+    log_prior_norm = (dim_parameters / 2.0) * jnp.log(2.0 * jnp.pi)
+
+    def log_joint(theta, x_obs):
+        lp_prior = -0.5 * jnp.sum(theta**2) - log_prior_norm
+        ll = ode_ll_fn(theta, x_obs)
+        return lp_prior + ll
+
+    v_log_joint = jax.vmap(log_joint, in_axes=(0, None))
+
+    @functools.partial(
+        jax.jit,
+        static_argnames=[
+            "n_chains",
+            "num_samples_per_chain",
+            "burn_in",
+            "inner_thin",
+            "n_sir",
+        ],
+    )
+    def run_mcmc(
+        x_obs,
+        rng_key,
+        n_chains: int = 20,
+        num_samples_per_chain: int = 500,
+        burn_in: int = 500,
+        inner_thin: int = 4,
+        step_size: float = 0.05,
+        n_sir: int = 100,
+        **kwargs,
+    ):
+        k_init, k_mcmc = jax.random.split(rng_key)
+
+        def init_single_chain(k):
+            thetas_sir = jax.random.normal(k, shape=(n_sir, dim_parameters))
+            lps = v_log_joint(thetas_sir, x_obs)
+            best_th = thetas_sir[jnp.argmax(lps)]
+            init_lp = log_joint(best_th, x_obs)
+            return best_th, init_lp
+
+        init_keys = jax.random.split(k_init, n_chains)
+        curr_thetas, curr_lp = jax.vmap(init_single_chain)(init_keys)
+
+        def scan_step(state, subkey):
+            keys_th = jax.random.split(subkey, inner_thin)
+
+            def theta_step(carry, subkey_th):
+                th, lp = carry
+                k_p, k_a = jax.random.split(subkey_th)
+                prop_th = th + jax.random.normal(k_p, shape=th.shape) * step_size
+                prop_lp = v_log_joint(prop_th, x_obs)
+                alpha = jnp.minimum(1.0, jnp.exp(prop_lp - lp))
+                acc = jax.random.uniform(k_a, shape=(n_chains,)) < alpha
+                new_th = jnp.where(acc[:, None], prop_th, th)
+                new_lp = jnp.where(acc, prop_lp, lp)
+                return (new_th, new_lp), None
+
+            (curr_thetas, curr_lp), _ = jax.lax.scan(
+                theta_step, state, keys_th
+            )
+            return (curr_thetas, curr_lp), curr_thetas
+
+        total_steps = burn_in + num_samples_per_chain
+        keys = jax.random.split(k_mcmc, total_steps)
+        _, all_samples = jax.lax.scan(
+            scan_step, (curr_thetas, curr_lp), keys
+        )
+        post_burnin = all_samples[burn_in:]
+        return post_burnin.transpose(1, 0, 2).reshape(-1, dim_parameters)
+
+    return run_mcmc
+

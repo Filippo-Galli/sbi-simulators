@@ -6,11 +6,17 @@ from typing import override
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pyro
 import pyro.distributions as pdist
 import torch
 
 from ..compositional import sample_two_step
-from ..mcmc import build_gibbs_pmmh_sampler, build_particle_filter_ll
+from ..mcmc import (
+    build_gibbs_pmmh_sampler,
+    build_ode_ll,
+    build_ode_mcmc_sampler,
+    build_particle_filter_ll,
+)
 from ..Simulator import Simulator
 
 
@@ -18,6 +24,7 @@ def _build_sir_step_fn(
     dt: float = 0.01,
     inner_steps: int = 5,
     sigma1: float = 0.1,
+    mode: str = "sde",
 ):
     """Build single observation step transition function in JAX for SIR."""
 
@@ -41,9 +48,12 @@ def _build_sir_step_fn(
         def inner_loop(i, curr_x):
             curr_x = jnp.clip(curr_x, 0.0)
             xdt = drift(curr_x, gamma, beta)
-            dWt = jax.random.normal(keys[i], shape=(3,)) * jnp.sqrt(dt)
-            B = diffusion(curr_x)
-            curr_x = curr_x + xdt * dt + jnp.dot(B, dWt)
+            if mode == "ode":
+                curr_x = curr_x + xdt * dt
+            else:
+                dWt = jax.random.normal(keys[i], shape=(3,)) * jnp.sqrt(dt)
+                B = diffusion(curr_x)
+                curr_x = curr_x + xdt * dt + jnp.dot(B, dWt)
             return jnp.clip(curr_x, 0.0)
 
         return jax.lax.fori_loop(0, inner_steps, inner_loop, x)
@@ -102,12 +112,18 @@ class SIR(Simulator):
         num_steps: int = 11,
         obs_sigma: float = 0.01,
         summary: str | None = None,
+        mode: str = "sde",
     ):
         self.dim_parameters = dim_parameters
         if dim_parameters != 2:
             raise ValueError(
                 f"SIR requires dim_parameters=2 (gamma, beta), got {dim_parameters}."
             )
+
+        mode = mode.lower()
+        if mode not in ("sde", "ode"):
+            raise ValueError(f"mode must be 'sde' or 'ode', got '{mode}'.")
+        self.mode = mode
 
         self.dt = dt
         self.inner_steps = inner_steps
@@ -138,25 +154,54 @@ class SIR(Simulator):
             scale=torch.ones(2, dtype=torch.float32),
         ).to_event(1)
 
-        # Build JAX SDE solver and Particle Filter MCMC sampler
+        # PRNG state management
+        self._rng_key = jax.random.PRNGKey(self.seed)
+
+        # Build JAX solver
         self._step_fn = _build_sir_step_fn(
             dt=self.dt,
             inner_steps=self.inner_steps,
             sigma1=self.sigma1,
+            mode=self.mode,
         )
         self._jax_solver_batch, self._jax_solver_single = _build_sir_sde_jax_solver(
             self._step_fn,
             num_steps=self.num_steps,
         )
-        self._pf_ll_fn = build_particle_filter_ll(
-            self._step_fn,
-            obs_dim=3,
-            obs_sigma=self.obs_sigma,
-        )
-        self._jax_mcmc = build_gibbs_pmmh_sampler(
-            self._pf_ll_fn,
-            dim_parameters=self.dim_parameters,
-        )
+
+        if self.mode == "ode":
+            self._ode_ll_fn = build_ode_ll(
+                self._jax_solver_single,
+                obs_dim=3,
+                num_steps=self.num_steps,
+                obs_sigma=self.obs_sigma,
+            )
+            self._jax_mcmc = build_ode_mcmc_sampler(
+                self._ode_ll_fn,
+                dim_parameters=self.dim_parameters,
+            )
+        else:
+            self._pf_ll_fn = build_particle_filter_ll(
+                self._step_fn,
+                obs_dim=3,
+                obs_sigma=self.obs_sigma,
+            )
+            self._jax_mcmc = build_gibbs_pmmh_sampler(
+                self._pf_ll_fn,
+                dim_parameters=self.dim_parameters,
+            )
+
+    def _next_rng_key(self) -> jax.Array:
+        self._rng_key, subkey = jax.random.split(self._rng_key)
+        return subkey
+
+    def reset_rng(self, seed: int | None = None) -> None:
+        """Reset internal PRNG state for reproducibility."""
+        if seed is not None:
+            self.seed = seed
+        self._rng_key = jax.random.PRNGKey(self.seed)
+        pyro.set_rng_seed(self.seed)
+        torch.manual_seed(self.seed)
 
     def _solve(
         self,
@@ -164,7 +209,7 @@ class SIR(Simulator):
         u0: torch.Tensor | None = None,
         rng_key: jax.Array | None = None,
     ) -> torch.Tensor:
-        """Batched SDE Euler-Maruyama simulation accelerated via JAX.
+        """Batched simulation accelerated via JAX.
 
         parameters: (num_samples, 2) tensor of raw thetas
         u0: optional (num_samples, 3) tensor of initial states
@@ -175,7 +220,7 @@ class SIR(Simulator):
         batch_size = params_jax.shape[0]
 
         if rng_key is None:
-            rng_key = jax.random.PRNGKey(self.seed)
+            rng_key = self._next_rng_key()
         keys = jax.random.split(rng_key, batch_size)
 
         if u0 is not None:
@@ -355,13 +400,15 @@ class SIR(Simulator):
             dR = gamma * I
             drift_step = torch.stack([dS, dI, dR], dim=-1)
 
-            dW = torch.randn_like(curr_u) * math.sqrt(actual_h)
-            diff_0 = 0.01 * dW[:, 0]
-            diff_1 = I * sig1 * dW[:, 1]
-            diff_2 = 0.01 * dW[:, 2]
-            diff_step = torch.stack([diff_0, diff_1, diff_2], dim=-1)
-
-            curr_u = torch.clamp(curr_u + drift_step * actual_h + diff_step, min=0.0)
+            if self.mode == "ode":
+                curr_u = torch.clamp(curr_u + drift_step * actual_h, min=0.0)
+            else:
+                dW = torch.randn_like(curr_u) * math.sqrt(actual_h)
+                diff_0 = 0.01 * dW[:, 0]
+                diff_1 = I * sig1 * dW[:, 1]
+                diff_2 = 0.01 * dW[:, 2]
+                diff_step = torch.stack([diff_0, diff_1, diff_2], dim=-1)
+                curr_u = torch.clamp(curr_u + drift_step * actual_h + diff_step, min=0.0)
 
         return curr_u.squeeze(0) if is_1d else curr_u
 
@@ -462,6 +509,8 @@ class SIR(Simulator):
             parameters = parameters.unsqueeze(0)
 
         num_samples = parameters.shape[0]
+        if isinstance(x_obs, np.ndarray):
+            x_obs = np.array(x_obs, copy=True)
         x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
         if x_obs_tensor.ndim == 1:
             x_obs_2d = x_obs_tensor.reshape(3, -1).T
@@ -473,7 +522,12 @@ class SIR(Simulator):
         x_jax = jnp.asarray(x_obs_2d.detach().cpu().numpy())
         params_jax = jnp.asarray(parameters.detach().cpu().numpy())
 
-        key = jax.random.PRNGKey(self.seed)
+        if self.mode == "ode":
+            v_ll = jax.vmap(lambda th: self._ode_ll_fn(th, x_jax))
+            lls_jax = v_ll(params_jax)
+            return torch.from_numpy(np.array(lls_jax, copy=True))
+
+        key = self._next_rng_key()
         keys = jax.random.split(key, num_samples)
 
         v_ll = jax.vmap(
@@ -493,7 +547,7 @@ class SIR(Simulator):
         step_size: float = 0.1,
         **kwargs,
     ) -> torch.Tensor:
-        """Sample from posterior p(theta | x_obs) using JAX Gibbs PMMH."""
+        """Sample from posterior p(theta | x_obs) using JAX MCMC (ODE MCMC or Gibbs PMMH for SDE)."""
         if (
             x_obs is None
             and "num_samples" in kwargs
@@ -520,6 +574,8 @@ class SIR(Simulator):
                 dtype=torch.float32,
             )
 
+        if isinstance(x_obs, np.ndarray):
+            x_obs = np.array(x_obs, copy=True)
         x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
         if x_obs_tensor.ndim == 1:
             x_obs_2d = x_obs_tensor.reshape(3, -1).T
@@ -529,20 +585,31 @@ class SIR(Simulator):
             x_obs_2d = x_obs_tensor
 
         x_jax = jnp.asarray(x_obs_2d.detach().cpu().numpy())
-        rng_key = jax.random.PRNGKey(self.seed)
+        rng_key = self._next_rng_key()
 
         num_samples_per_chain = math.ceil(num_samples / n_chains)
 
-        samples_jax = self._jax_mcmc(
-            x_jax,
-            rng_key,
-            n_chains=n_chains,
-            num_samples_per_chain=num_samples_per_chain,
-            burn_in=burn_in,
-            inner_thin=inner_thin,
-            n_particles=n_particles,
-            step_size=step_size,
-        )
+        if self.mode == "ode":
+            samples_jax = self._jax_mcmc(
+                x_jax,
+                rng_key,
+                n_chains=n_chains,
+                num_samples_per_chain=num_samples_per_chain,
+                burn_in=burn_in,
+                inner_thin=inner_thin,
+                step_size=step_size,
+            )
+        else:
+            samples_jax = self._jax_mcmc(
+                x_jax,
+                rng_key,
+                n_chains=n_chains,
+                num_samples_per_chain=num_samples_per_chain,
+                burn_in=burn_in,
+                inner_thin=inner_thin,
+                n_particles=n_particles,
+                step_size=step_size,
+            )
         samples_np = np.array(samples_jax, copy=True)
         np.random.shuffle(samples_np)
         samples_torch = torch.from_numpy(samples_np)

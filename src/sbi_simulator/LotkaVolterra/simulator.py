@@ -6,11 +6,17 @@ from typing import override
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pyro
 import pyro.distributions as pdist
 import torch
 
 from ..compositional import sample_two_step
-from ..mcmc import build_gibbs_pmmh_sampler, build_particle_filter_ll
+from ..mcmc import (
+    build_gibbs_pmmh_sampler,
+    build_ode_ll,
+    build_ode_mcmc_sampler,
+    build_particle_filter_ll,
+)
 from ..Simulator import Simulator
 
 
@@ -19,6 +25,7 @@ def _build_lv_step_fn(
     inner_steps: int = 5,
     sigma1: float = 0.1,
     sigma2: float = 0.1,
+    mode: str = "sde",
 ):
     """Build single observation step transition function in JAX for Lotka-Volterra."""
 
@@ -30,9 +37,12 @@ def _build_lv_step_fn(
     def integrate_step(x, key, alpha, beta, gamma, delta):
         x = jnp.clip(x, 0.0)
         xdt = drift(x, alpha, beta, gamma, delta)
-        dWt = jax.random.normal(key, shape=(2,)) * jnp.sqrt(dt)
-        B = jnp.array([sigma1 * x[0] * x[1], sigma2 * x[1] * x[0]])
-        x = x + xdt * dt + B * dWt
+        if mode == "ode":
+            x = x + xdt * dt
+        else:
+            dWt = jax.random.normal(key, shape=(2,)) * jnp.sqrt(dt)
+            B = jnp.array([sigma1 * x[0] * x[1], sigma2 * x[1] * x[0]])
+            x = x + xdt * dt + B * dWt
         return jnp.clip(x, 0.0)
 
     def step_one(x, key, theta):
@@ -101,6 +111,7 @@ class LotkaVolterra(Simulator):
         num_steps: int = 11,
         obs_sigma: float = 0.05,
         summary: str | None = None,
+        mode: str = "sde",
     ):
         self.dim_parameters = dim_parameters
         if dim_parameters != 4:
@@ -108,6 +119,11 @@ class LotkaVolterra(Simulator):
                 f"LotkaVolterra requires dim_parameters=4 (alpha, beta, "
                 f"gamma, delta), got {dim_parameters}."
             )
+
+        mode = mode.lower()
+        if mode not in ("sde", "ode"):
+            raise ValueError(f"mode must be 'sde' or 'ode', got '{mode}'.")
+        self.mode = mode
 
         self.dt = dt
         self.inner_steps = inner_steps
@@ -139,26 +155,55 @@ class LotkaVolterra(Simulator):
             scale=torch.ones(4, dtype=torch.float32),
         ).to_event(1)
 
-        # Build JAX SDE solver and Particle Filter MCMC sampler
+        # PRNG state management
+        self._rng_key = jax.random.PRNGKey(self.seed)
+
+        # Build JAX solver
         self._step_fn = _build_lv_step_fn(
             dt=self.dt,
             inner_steps=self.inner_steps,
             sigma1=self.sigma1,
             sigma2=self.sigma2,
+            mode=self.mode,
         )
         self._jax_solver_batch, self._jax_solver_single = _build_lv_sde_jax_solver(
             self._step_fn,
             num_steps=self.num_steps,
         )
-        self._pf_ll_fn = build_particle_filter_ll(
-            self._step_fn,
-            obs_dim=2,
-            obs_sigma=self.obs_sigma,
-        )
-        self._jax_mcmc = build_gibbs_pmmh_sampler(
-            self._pf_ll_fn,
-            dim_parameters=self.dim_parameters,
-        )
+
+        if self.mode == "ode":
+            self._ode_ll_fn = build_ode_ll(
+                self._jax_solver_single,
+                obs_dim=2,
+                num_steps=self.num_steps,
+                obs_sigma=self.obs_sigma,
+            )
+            self._jax_mcmc = build_ode_mcmc_sampler(
+                self._ode_ll_fn,
+                dim_parameters=self.dim_parameters,
+            )
+        else:
+            self._pf_ll_fn = build_particle_filter_ll(
+                self._step_fn,
+                obs_dim=2,
+                obs_sigma=self.obs_sigma,
+            )
+            self._jax_mcmc = build_gibbs_pmmh_sampler(
+                self._pf_ll_fn,
+                dim_parameters=self.dim_parameters,
+            )
+
+    def _next_rng_key(self) -> jax.Array:
+        self._rng_key, subkey = jax.random.split(self._rng_key)
+        return subkey
+
+    def reset_rng(self, seed: int | None = None) -> None:
+        """Reset internal PRNG state for reproducibility."""
+        if seed is not None:
+            self.seed = seed
+        self._rng_key = jax.random.PRNGKey(self.seed)
+        pyro.set_rng_seed(self.seed)
+        torch.manual_seed(self.seed)
 
     def _solve(
         self,
@@ -166,7 +211,7 @@ class LotkaVolterra(Simulator):
         u0: torch.Tensor | None = None,
         rng_key: jax.Array | None = None,
     ) -> torch.Tensor:
-        """Batched SDE Euler-Maruyama simulation accelerated via JAX.
+        """Batched simulation accelerated via JAX.
 
         parameters: (num_samples, 4) tensor of raw thetas
         u0: optional (num_samples, 2) tensor of initial states
@@ -177,7 +222,7 @@ class LotkaVolterra(Simulator):
         batch_size = params_jax.shape[0]
 
         if rng_key is None:
-            rng_key = jax.random.PRNGKey(self.seed)
+            rng_key = self._next_rng_key()
         keys = jax.random.split(rng_key, batch_size)
 
         if u0 is not None:
@@ -325,12 +370,14 @@ class LotkaVolterra(Simulator):
             dx1 = -gamma * p1 + delta * p0 * p1
             drift_step = torch.stack([dx0, dx1], dim=-1)
 
-            dW = torch.randn_like(curr_u) * math.sqrt(actual_h)
-            diff_0 = sig1 * p0 * p1 * dW[:, 0]
-            diff_1 = sig2 * p1 * p0 * dW[:, 1]
-            diff_step = torch.stack([diff_0, diff_1], dim=-1)
-
-            curr_u = torch.clamp(curr_u + drift_step * actual_h + diff_step, min=0.0)
+            if self.mode == "ode":
+                curr_u = torch.clamp(curr_u + drift_step * actual_h, min=0.0)
+            else:
+                dW = torch.randn_like(curr_u) * math.sqrt(actual_h)
+                diff_0 = sig1 * p0 * p1 * dW[:, 0]
+                diff_1 = sig2 * p1 * p0 * dW[:, 1]
+                diff_step = torch.stack([diff_0, diff_1], dim=-1)
+                curr_u = torch.clamp(curr_u + drift_step * actual_h + diff_step, min=0.0)
 
         return curr_u.squeeze(0) if is_1d else curr_u
 
@@ -431,6 +478,8 @@ class LotkaVolterra(Simulator):
             parameters = parameters.unsqueeze(0)
 
         num_samples = parameters.shape[0]
+        if isinstance(x_obs, np.ndarray):
+            x_obs = np.array(x_obs, copy=True)
         x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
         if x_obs_tensor.ndim == 1:
             x_obs_2d = x_obs_tensor.reshape(2, -1).T
@@ -442,7 +491,12 @@ class LotkaVolterra(Simulator):
         x_jax = jnp.asarray(x_obs_2d.detach().cpu().numpy())
         params_jax = jnp.asarray(parameters.detach().cpu().numpy())
 
-        key = jax.random.PRNGKey(self.seed)
+        if self.mode == "ode":
+            v_ll = jax.vmap(lambda th: self._ode_ll_fn(th, x_jax))
+            lls_jax = v_ll(params_jax)
+            return torch.from_numpy(np.array(lls_jax, copy=True))
+
+        key = self._next_rng_key()
         keys = jax.random.split(key, num_samples)
 
         v_ll = jax.vmap(
@@ -462,7 +516,7 @@ class LotkaVolterra(Simulator):
         step_size: float = 0.3,
         **kwargs,
     ) -> torch.Tensor:
-        """Sample from posterior p(theta | x_obs) using JAX Gibbs PMMH."""
+        """Sample from posterior p(theta | x_obs) using JAX MCMC (ODE MCMC or Gibbs PMMH for SDE)."""
         if (
             x_obs is None
             and "num_samples" in kwargs
@@ -489,6 +543,8 @@ class LotkaVolterra(Simulator):
                 dtype=torch.float32,
             )
 
+        if isinstance(x_obs, np.ndarray):
+            x_obs = np.array(x_obs, copy=True)
         x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
         if x_obs_tensor.ndim == 1:
             x_obs_2d = x_obs_tensor.reshape(2, -1).T
@@ -498,20 +554,31 @@ class LotkaVolterra(Simulator):
             x_obs_2d = x_obs_tensor
 
         x_jax = jnp.asarray(x_obs_2d.detach().cpu().numpy())
-        rng_key = jax.random.PRNGKey(self.seed)
+        rng_key = self._next_rng_key()
 
         num_samples_per_chain = math.ceil(num_samples / n_chains)
 
-        samples_jax = self._jax_mcmc(
-            x_jax,
-            rng_key,
-            n_chains=n_chains,
-            num_samples_per_chain=num_samples_per_chain,
-            burn_in=burn_in,
-            inner_thin=inner_thin,
-            n_particles=n_particles,
-            step_size=step_size,
-        )
+        if self.mode == "ode":
+            samples_jax = self._jax_mcmc(
+                x_jax,
+                rng_key,
+                n_chains=n_chains,
+                num_samples_per_chain=num_samples_per_chain,
+                burn_in=burn_in,
+                inner_thin=inner_thin,
+                step_size=step_size,
+            )
+        else:
+            samples_jax = self._jax_mcmc(
+                x_jax,
+                rng_key,
+                n_chains=n_chains,
+                num_samples_per_chain=num_samples_per_chain,
+                burn_in=burn_in,
+                inner_thin=inner_thin,
+                n_particles=n_particles,
+                step_size=step_size,
+            )
         samples_np = np.array(samples_jax, copy=True)
         np.random.shuffle(samples_np)
         samples_torch = torch.from_numpy(samples_np)

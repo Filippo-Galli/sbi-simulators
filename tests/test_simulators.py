@@ -636,3 +636,76 @@ def test_linear_sde_variants():
     th_g = g_sde.get_prior().sample((3,))
     x_g = g_sde.simulate(th_g)
     assert x_g.shape == (3, 22)
+
+
+def test_sir_mode_and_prng():
+    """Verify SIR ODE and SDE modes and PRNG key state advancement."""
+    # SDE mode should advance PRNG key across consecutive simulate() calls
+    sir_sde = SIMULATORS["SIR"](seed=42, mode="sde")
+    assert sir_sde.mode == "sde"
+    th = torch.tensor([0.33, 0.12])
+    x1 = sir_sde.simulate(th)
+    x2 = sir_sde.simulate(th)
+    assert not torch.allclose(x1, x2), "Consecutive simulate calls in SDE mode must be stochastic"
+
+    # reset_rng restores exact seed sequence
+    sir_sde.reset_rng(42)
+    x1_reset = sir_sde.simulate(th)
+    assert torch.allclose(x1, x1_reset), "reset_rng must restore initial reproducible state"
+
+    # ODE mode must be deterministic
+    sir_ode = SIMULATORS["SIR"](seed=42, mode="ode")
+    assert sir_ode.mode == "ode"
+    xo1 = sir_ode.simulate(th)
+    xo2 = sir_ode.simulate(th)
+    assert torch.allclose(xo1, xo2), "ODE simulate calls must be deterministic"
+
+    # Log likelihood and posterior samples in ODE mode
+    ll_ode = sir_ode.log_likelihood(th, xo1)
+    assert torch.isfinite(ll_ode).all()
+    samples_ode = sir_ode.posterior_samples(xo1, num_samples=50, n_chains=2, burn_in=20)
+    assert samples_ode.shape == (50, 2)
+    assert torch.isfinite(samples_ode).all()
+
+    # Stepper in ODE mode
+    x_curr = torch.tensor([[4.0, 1.0, 0.0]])
+    x_next_ode = sir_ode.stepper(x_curr, th)
+    assert x_next_ode.shape == (1, 3)
+    assert torch.isfinite(x_next_ode).all()
+
+
+def test_lotka_volterra_mode_and_prng():
+    """Verify LotkaVolterra ODE and SDE modes and PRNG key state advancement."""
+    # SDE mode should advance PRNG key across consecutive simulate() calls
+    lv_sde = SIMULATORS["LotkaVolterra"](seed=42, mode="sde")
+    assert lv_sde.mode == "sde"
+    th = torch.zeros(4)
+    x1 = lv_sde.simulate(th)
+    x2 = lv_sde.simulate(th)
+    assert not torch.allclose(x1, x2), "Consecutive simulate calls in SDE mode must be stochastic"
+
+    # reset_rng restores exact seed sequence
+    lv_sde.reset_rng(42)
+    x1_reset = lv_sde.simulate(th)
+    assert torch.allclose(x1, x1_reset), "reset_rng must restore initial reproducible state"
+
+    # ODE mode must be deterministic
+    lv_ode = SIMULATORS["LotkaVolterra"](seed=42, mode="ode")
+    assert lv_ode.mode == "ode"
+    xo1 = lv_ode.simulate(th)
+    xo2 = lv_ode.simulate(th)
+    assert torch.allclose(xo1, xo2), "ODE simulate calls must be deterministic"
+
+    # Log likelihood and posterior samples in ODE mode
+    ll_ode = lv_ode.log_likelihood(th, xo1)
+    assert torch.isfinite(ll_ode).all()
+    samples_ode = lv_ode.posterior_samples(xo1, num_samples=50, n_chains=2, burn_in=20)
+    assert samples_ode.shape == (50, 4)
+    assert torch.isfinite(samples_ode).all()
+
+    # Stepper in ODE mode
+    x_curr = torch.tensor([[1.0, 0.5]])
+    x_next_ode = lv_ode.stepper(x_curr, th)
+    assert x_next_ode.shape == (1, 2)
+    assert torch.isfinite(x_next_ode).all()
+
