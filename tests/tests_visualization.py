@@ -1,4 +1,3 @@
-import math
 import os
 
 import corner
@@ -12,8 +11,9 @@ if not os.environ.get("DISPLAY"):
 
 
 def print_corner(simulator: Simulator, simulator_name: str):
-    if hasattr(simulator, "canonical_theta") and simulator.canonical_theta is not None:
-        theta_0 = simulator.canonical_theta.unsqueeze(0)
+    canonical_theta = getattr(simulator, "canonical_theta", None)
+    if isinstance(canonical_theta, torch.Tensor):
+        theta_0 = canonical_theta.unsqueeze(0)
     else:
         theta_0 = simulator.get_prior().sample((1,))
 
