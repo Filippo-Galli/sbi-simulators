@@ -18,23 +18,17 @@ import torch
 from scipy import stats
 
 from ..base import Simulator
+from ..sampling import rejection_sample_box
 
 
 class UniformGaussian(Simulator):
     """Uniform-Gaussian simulator as introduced in Samaroo et al. (2026).
 
     Model specification:
-        - Parameter prior: theta ~ Uniform([-L_d, L_d]^d)
-        - Data likelihood: x | theta ~ N(theta, sigma^2 * I_d)
-        - Observed data: x_obs = 0 (by default)
-        - Ground truth posterior:
-            theta | {x_obs = 0} ~ N_{[-L_d, L_d]^d}(0, sigma^2 * I_d)
-
-    Prior width L_d:
-        Defined as L_d := sqrt(F_{chi^2_d}^{-1}(alpha)) where alpha = 0.99 by default,
-        ensuring that the hypersphere S_{L_d} := {theta: ||theta||_2 <= L_d} is a 99%
-        credible region of the untruncated posterior N(0, I_d).
-
+        - Parameter prior: ``theta ~ Uniform([-L_d, L_d]^d)``
+        - Data likelihood: ``x | theta ~ N(theta, sigma^2 * I_d)``
+        - Observed data: ``x_obs = 0`` (by default)
+        - Ground truth posterior: ``theta | x_obs ~ N_{[-L_d, L_d]^d}(x_mean, (sigma^2 / N) * I_d)``
     """
 
     def __init__(
@@ -66,8 +60,6 @@ class UniformGaussian(Simulator):
         super().__init__(
             seed=seed, dim_parameters=dim_parameters, dim_data=dim_data, **kwargs
         )
-        torch.manual_seed(seed)
-        np.random.seed(seed)
 
         if L is not None:
             self.L = float(L)
@@ -78,67 +70,39 @@ class UniformGaussian(Simulator):
 
     @staticmethod
     def compute_prior_bound(dim: int, alpha: float = 0.99) -> float:
-        """Compute the prior bound L_d = sqrt(F_{chi^2_d}^{-1}(alpha)).
-
-        Args:
-            dim: Dimension of the parameter space.
-            alpha: Confidence level for the prior bound.
-
-        Returns:
-            The prior bound L_d.
-        """
+        """Compute the prior bound ``L_d = sqrt(F_{chi^2_d}^{-1}(alpha))``."""
         if dim <= 0:
             raise ValueError(f"dim must be positive, got {dim}")
-
         return float(np.sqrt(stats.chi2.ppf(alpha, df=dim)))
 
     @property
     def default_x_obs(self) -> torch.Tensor:
-        """Standard conditioning point x_obs = 0 as studied in the paper."""
+        """Standard conditioning point ``x_obs = 0``."""
         return torch.zeros(self.dim_data, dtype=torch.float32)
 
     @property
     def default_theta_true(self) -> torch.Tensor:
-        """Ground truth theta = 0 associated with default x_obs = 0."""
+        """Ground truth ``theta = 0`` associated with ``default_x_obs``."""
         return torch.zeros(self.dim_parameters, dtype=torch.float32)
 
     @override
     def get_prior(self) -> pdist.Distribution:
-        """Return the uniform prior Uniform([-L_d, L_d]^d)."""
+        """Return the uniform prior ``Uniform([-L_d, L_d]^d)``."""
         low = -self.L * torch.ones(self.dim_parameters, dtype=torch.float32)
         high = self.L * torch.ones(self.dim_parameters, dtype=torch.float32)
         return pdist.Uniform(low, high).to_event(1)
 
-    def sample_prior(self, num_samples: int = 1000) -> torch.Tensor:
-        """Draw samples from the prior distribution theta ~ Uniform([-L_d, L_d]^d)."""
-        return self.get_prior().sample((num_samples,))
-
     @override
     def simulate(self, parameters: torch.Tensor | np.ndarray) -> torch.Tensor:
-        """Simulate synthetic data x = parameters + sigma * noise, noise ~ N(0, I_d).
-
-        Args:
-            parameters: 1D tensor/array of shape (d,) or 2D batched of shape (N, d).
-
-        Returns:
-            Simulated data with matching shape.
-        """
-        params = torch.as_tensor(parameters, dtype=torch.float32)
-        if params.numel() == 0:
-            raise ValueError("Expected at least one parameter.")
-
-        if params.ndim == 1:
-            if params.shape[0] != self.dim_parameters:
-                raise ValueError(
-                    f"Expected {self.dim_parameters} parameters, got {params.shape[0]}."
-                )
-        elif params.ndim >= 2 and params.shape[-1] != self.dim_parameters:
+        """Simulate synthetic data ``x = parameters + sigma * noise``, ``noise ~ N(0, I_d)``."""
+        params, is_1d = self._prepare_parameters(parameters)
+        if params.shape[-1] != self.dim_parameters:
             raise ValueError(
                 f"Expected {self.dim_parameters} parameters on last dimension, "
                 f"got {params.shape[-1]}."
             )
-
-        return params + self.sigma * torch.randn_like(params)
+        out = params + self.sigma * torch.randn_like(params)
+        return out.squeeze(0) if is_1d else out
 
     @override
     def posterior_samples(
@@ -147,16 +111,7 @@ class UniformGaussian(Simulator):
         num_samples: int = 1000,
         **kwargs,
     ) -> torch.Tensor:
-        """Draw exact samples from the ground truth posterior:
-        theta | x_obs ~ N_{[-L_d, L_d]^d}(x_mean, (sigma^2 / N) * I_d).
-
-        Args:
-            x_obs: Observation to condition on (1D or NxDim). Defaults to 0 (the paper's benchmark setting).
-            num_samples: Number of posterior samples to draw.
-
-        Returns:
-            torch.Tensor of shape (num_samples, dim_parameters).
-        """
+        """Draw exact samples from ``theta | x_obs ~ N_{[-L_d, L_d]^d}(x_mean, (sigma^2 / N) * I_d)``."""
         if x_obs is None:
             x_obs_t = self.default_x_obs.unsqueeze(0)
         else:
@@ -164,50 +119,40 @@ class UniformGaussian(Simulator):
             if x_obs_t.ndim == 1:
                 x_obs_t = x_obs_t.unsqueeze(0)
 
-        n_obs = x_obs_t.shape[0]
-        d = x_obs_t.shape[-1]
+        n_obs, d = x_obs_t.shape
         if d != self.dim_parameters:
             raise ValueError(
                 f"Expected x_obs with {self.dim_parameters} elements per observation, got {d}."
             )
 
         L = self.L
-        effective_sigma = self.sigma / np.sqrt(n_obs)
+        effective_sigma = self.sigma / math.sqrt(n_obs)
         x_mean = x_obs_t.mean(dim=0)
 
-        # Rejection sampling:
-        samples_list: list[torch.Tensor] = []
-        collected = 0
-        max_rejection_attempts = 15
-        attempts = 0
-
-        while collected < num_samples and attempts < max_rejection_attempts:
-            attempts += 1
-            needed = num_samples - collected
-            batch_size = max(needed * 2, 1000)
-            candidates = x_mean + effective_sigma * torch.randn(
-                batch_size, d, dtype=torch.float32
+        def propose(batch_size: int) -> torch.Tensor:
+            return x_mean + effective_sigma * torch.randn(
+                (batch_size, d), dtype=torch.float32, device=x_mean.device
             )
-            mask = torch.all((candidates >= -L) & (candidates <= L), dim=-1)
-            accepted = candidates[mask]
-            if accepted.numel() > 0:
-                n_take = min(accepted.shape[0], needed)
-                samples_list.append(accepted[:n_take])
-                collected += n_take
 
-        if collected >= num_samples:
-            return torch.cat(samples_list, dim=0)
+        def fallback(remaining: int) -> torch.Tensor:
+            x_np = x_mean.cpu().numpy()
+            a = (-L - x_np) / effective_sigma
+            b = (L - x_np) / effective_sigma
+            rvs = stats.truncnorm.rvs(
+                a,
+                b,
+                loc=x_np,
+                scale=effective_sigma,
+                size=(remaining, d),
+                random_state=self._np_rng,
+            )
+            return torch.as_tensor(rvs, dtype=torch.float32)
 
-        # Fallback to independent coordinate-wise truncated normal if rejection rate is low
-        # (e.g. if x_mean is located near or outside the boundary).
-        remaining = num_samples - collected
-        x_np = x_mean.cpu().numpy()
-        a = (-L - x_np) / effective_sigma
-        b = (L - x_np) / effective_sigma
-        fallback_samples = stats.truncnorm.rvs(
-            a, b, loc=x_np, scale=effective_sigma, size=(remaining, d)
+        return rejection_sample_box(
+            propose,
+            num_samples,
+            low=-L,
+            high=L,
+            max_attempts=15,
+            fallback_fn=fallback,
         )
-        fallback_t = torch.as_tensor(fallback_samples, dtype=torch.float32)
-        if samples_list:
-            return torch.cat([torch.cat(samples_list, dim=0), fallback_t], dim=0)
-        return fallback_t

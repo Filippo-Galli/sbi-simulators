@@ -2,7 +2,34 @@
 
 from collections.abc import Callable
 
+import numpy as np
 import torch
+from scipy import special as sp_special
+
+
+def log_normal_box_prob(
+    means: np.ndarray,
+    sigma: float,
+    low: float,
+    high: float,
+) -> np.ndarray:
+    """Compute elementwise ``log P(X in [low, high])`` for ``X ~ N(means, sigma^2)``.
+
+    Uses tail-symmetry of ``scipy.special.log_ndtr`` and ``log(-expm1(...))``
+    to stay numerically stable deep in either tail.
+    """
+    a = (low - means) / sigma
+    b = (high - means) / sigma
+
+    # For a <= 0: Phi(b) - Phi(a) = Phi(b) * (1 - exp(log_Phi(a) - log_Phi(b)))
+    # For a > 0:  Phi(b) - Phi(a) = Phi(-a) - Phi(-b) = Phi(-a) * (1 - exp(log_Phi(-b) - log_Phi(-a)))
+    hi_arg = np.where(a <= 0.0, b, -a)
+    lo_arg = np.where(a <= 0.0, a, -b)
+
+    log_hi = sp_special.log_ndtr(hi_arg)
+    log_lo = sp_special.log_ndtr(lo_arg)
+    diff = np.minimum(log_lo - log_hi, -1e-300)
+    return log_hi + np.log(-np.expm1(diff))
 
 
 def rejection_sample_box(

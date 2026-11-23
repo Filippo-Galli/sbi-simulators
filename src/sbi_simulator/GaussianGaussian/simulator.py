@@ -17,13 +17,12 @@ class GaussianGaussian(Simulator):
 
     Presets:
     --------
-    - "default":
-      Configuration from 'Compositional Score Modeling for Simulation-Based Inference':
-      * Prior: N(0, I_d)
-      * Likelihood: N(x | theta, diag_sigma), variances linearly spaced in [0.6, 1.4]
-    - "sbibm" (Lueckmann et al., 2021, arXiv:2101.04653, Task 'gaussian_linear'):
-      * Prior: N(0, 0.1 * I_d)
-      * Likelihood: N(x | theta, 0.1 * I_d)
+    - ``"default"``:
+      Configuration from *Compositional Score Modeling for Simulation-Based Inference*:
+      Prior ``N(0, I_d)``, Likelihood ``N(x | theta, diag_sigma)`` with variances
+      linearly spaced in ``[0.6, 1.4]``.
+    - ``"sbibm"`` (Lueckmann et al., 2021, arXiv:2101.04653, Task ``'gaussian_linear'``):
+      Prior ``N(0, 0.1 * I_d)``, Likelihood ``N(x | theta, 0.1 * I_d)``.
     """
 
     def __init__(
@@ -49,27 +48,16 @@ class GaussianGaussian(Simulator):
     def _diag_sigma(self, dim: int) -> torch.Tensor:
         if self.preset == "sbibm":
             return torch.full((dim,), 0.1, dtype=torch.float32)
-        # Variances scaling linearly from 0.6 to 1.4 across `dim` entries
         if dim == 1:
-            return torch.tensor([0.6])
+            return torch.tensor([0.6], dtype=torch.float32)
         return 0.6 + torch.arange(dim, dtype=torch.float32) * (1.4 - 0.6) / (dim - 1)
 
     @override
     def simulate(self, parameters: torch.Tensor | np.ndarray) -> torch.Tensor:
-        params = torch.as_tensor(parameters, dtype=torch.float32)
-        if params.numel() == 0:
-            raise ValueError("Expected at least one parameter.")
-
-        is_1d = params.ndim == 1
-        if is_1d:
-            params = params.unsqueeze(0)
-
+        params, is_1d = self._prepare_parameters(parameters)
         dim = params.shape[-1]
-        diag_sigma = self._diag_sigma(dim).to(params.device)
-        std = torch.sqrt(diag_sigma)
-
-        noise = torch.randn_like(params) * std
-        out = params + noise
+        std = torch.sqrt(self._diag_sigma(dim).to(params.device))
+        out = params + torch.randn_like(params) * std
         return out.squeeze(0) if is_1d else out
 
     @override
@@ -87,32 +75,26 @@ class GaussianGaussian(Simulator):
         num_samples: int = 1000,
         **kwargs,
     ) -> torch.Tensor:
-        """Sample from the analytic posterior for the Gaussian/Gaussian simulator
-        with prior N(0, I) and likelihood N(x | theta, Sigma), Sigma diagonal.
-        Supports single observation (1D or 1xDim) or multiple observations (NxDim).
+        """Sample from the exact closed-form diagonal Gaussian posterior in ``O(D)`` time.
 
-        Posterior: theta | x_1...x_N ~ N(mu_post, Sigma_post)
-            Sigma_post = (I + N * Sigma^-1)^-1
-            mu_post    = Sigma_post @ Sigma^-1 @ sum_{i=1}^N x_i
+        Supports single observation ``(D,)`` / ``(1, D)`` or multiple i.i.d.
+        observations ``(N, D)``:
+            ``var_post = 1 / (1 / prior_var + N / diag_sigma)``
+            ``mean_post = var_post * (sum_i x_i / diag_sigma)``
         """
         if x_obs is None:
-            x_obs = torch.zeros(self.dim_data, dtype=torch.float32)
-
-        x_obs_t = torch.as_tensor(x_obs, dtype=torch.float32)
-        if x_obs_t.ndim == 1:
-            x_obs_t = x_obs_t.unsqueeze(0)
+            x_obs_t = torch.zeros((1, self.dim_data), dtype=torch.float32)
+        else:
+            x_obs_t = torch.as_tensor(x_obs, dtype=torch.float32)
+            if x_obs_t.ndim == 1:
+                x_obs_t = x_obs_t.unsqueeze(0)
 
         n_obs, dim = x_obs_t.shape
-        diag_sigma = self._diag_sigma(dim)
-        sigma_inv = torch.diag(1.0 / diag_sigma)
-
+        diag_sigma = self._diag_sigma(dim).to(x_obs_t.device)
         prior_var = 0.1 if self.preset == "sbibm" else 1.0
-        prior_precision = (1.0 / prior_var) * torch.eye(dim)
-        posterior_precision = prior_precision + n_obs * sigma_inv
-        posterior_cov = torch.linalg.inv(posterior_precision)
-        posterior_mean = posterior_cov @ (sigma_inv @ x_obs_t.sum(dim=0))
 
-        posterior = torch.distributions.MultivariateNormal(
-            loc=posterior_mean, covariance_matrix=posterior_cov
+        post_var = 1.0 / (1.0 / prior_var + n_obs / diag_sigma)
+        post_mean = post_var * (x_obs_t.sum(dim=0) / diag_sigma)
+        return post_mean + torch.sqrt(post_var) * torch.randn(
+            (num_samples, dim), dtype=torch.float32, device=x_obs_t.device
         )
-        return posterior.sample((num_samples,))

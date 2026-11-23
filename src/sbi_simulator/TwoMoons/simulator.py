@@ -9,8 +9,16 @@ import torch
 
 from ..base import Simulator
 
+_ANG = -math.pi / 4.0
+_COS_ANG = math.cos(_ANG)
+_SIN_ANG = math.sin(_ANG)
+_COS_INV = _COS_ANG  # cos(-ang) == cos(ang)
+_SIN_INV = -_SIN_ANG  # sin(-ang) == -sin(ang)
+
 
 class TwoMoons(Simulator):
+    """Benchmark Two Moons simulator with multimodal crescent posterior."""
+
     def __init__(
         self,
         dim_parameters: int = 2,
@@ -19,6 +27,10 @@ class TwoMoons(Simulator):
         **kwargs,
     ):
         """Initialize the TwoMoons model."""
+        if dim_parameters != 2:
+            raise ValueError(
+                f"TwoMoons requires dim_parameters=2, got {dim_parameters}."
+            )
         self.a_low = -math.pi / 2.0
         self.a_high = +math.pi / 2.0
         self.base_offset = 0.25
@@ -28,11 +40,10 @@ class TwoMoons(Simulator):
         super().__init__(seed, dim_parameters, dim_data, **kwargs)
 
         prior_bound = 1.0
-        self.prior_params = {
-            "low": -prior_bound * torch.ones((self.dim_parameters,)),
-            "high": +prior_bound * torch.ones((self.dim_parameters,)),
-        }
-        self.prior_dist = pdist.Uniform(**self.prior_params).to_event(1)
+        self.prior_dist = pdist.Uniform(
+            low=-prior_bound * torch.ones((self.dim_parameters,)),
+            high=+prior_bound * torch.ones((self.dim_parameters,)),
+        ).to_event(1)
 
     @override
     def get_prior(self) -> pdist.Distribution:
@@ -40,38 +51,30 @@ class TwoMoons(Simulator):
 
     @override
     def simulate(self, parameters: torch.Tensor | np.ndarray) -> torch.Tensor:
-        """Simulate one observation from parameters.
+        """Simulate observations from parameters of shape ``(2,)`` or ``(B, 2)``."""
+        params, is_1d = self._prepare_parameters(parameters)
+        if params.shape[-1] != 2:
+            raise ValueError(f"Expected 2 parameters, got {params.shape[-1]}.")
 
-        Args:
-            parameters (torch.Tensor): 2D tensor, parameters for the simulation
+        batch_size = params.shape[0]
+        device = params.device
 
-        Returns:
-            x (torch.Tensor): Simulated observation of shape (batch_size, 2)
-        """
-        parameters = torch.atleast_2d(torch.as_tensor(parameters, dtype=torch.float32))
-        num_samples = parameters.shape[0]
-
-        a_dist = torch.distributions.Uniform(low=self.a_low, high=self.a_high)
-        a = a_dist.sample((num_samples, 1))
-
-        r_dist = torch.distributions.Normal(self.r_loc, self.r_scale)
-        r = r_dist.sample((num_samples, 1))
+        a = torch.empty((batch_size, 1), dtype=torch.float32, device=device).uniform_(
+            self.a_low, self.a_high
+        )
+        r = self.r_loc + self.r_scale * torch.randn(
+            (batch_size, 1), dtype=torch.float32, device=device
+        )
 
         p = torch.cat(
-            (
-                torch.cos(a) * r + self.base_offset,
-                torch.sin(a) * r,
-            ),
+            (torch.cos(a) * r + self.base_offset, torch.sin(a) * r),
             dim=1,
         )
 
-        ang = torch.tensor([-math.pi / 4.0])
-        c = torch.cos(ang)
-        s = torch.sin(ang)
-        z0 = (c * parameters[:, 0] - s * parameters[:, 1]).reshape(-1, 1)
-        z1 = (s * parameters[:, 0] + c * parameters[:, 1]).reshape(-1, 1)
-
-        return p + torch.cat((-torch.abs(z0), z1), dim=1)
+        z0 = _COS_ANG * params[:, 0:1] - _SIN_ANG * params[:, 1:2]
+        z1 = _SIN_ANG * params[:, 0:1] + _COS_ANG * params[:, 1:2]
+        out = p + torch.cat((-torch.abs(z0), z1), dim=1)
+        return out.squeeze(0) if is_1d else out
 
     @override
     def posterior_samples(
@@ -81,88 +84,69 @@ class TwoMoons(Simulator):
         prior_bounds: tuple[float, float] | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Exact posterior sampler p(theta | x_obs) for the Two Moons task
-        by inverting the simulator geometry.
-
-        Steps
-        -----
-        1. Sample latent crescent point p from the base distribution.
-        2. For fixed x_obs, solve x_obs = p + [-|z0|, z1] for (z0, z1).
-        3. Use random signs z0 = ±(p0 - x0_obs) with equal probability.
-        4. Rotate back to theta: theta = R(-ang) z.
-        5. Keep only theta inside the uniform prior box [-1, 1]^2.
-        """
+        """Exact posterior sampler ``p(theta | x_obs)`` by inverting the crescent geometry."""
         if x_obs is None:
             x_obs = torch.tensor([-0.6397, 0.1623], dtype=torch.float32)
 
-        if isinstance(x_obs, torch.Tensor):
-            x_obs_np = x_obs.detach().cpu().numpy().astype(float).reshape(-1)
-        else:
-            x_obs_np = np.asarray(x_obs, dtype=float).reshape(-1)
+        x_obs_flat = torch.as_tensor(x_obs, dtype=torch.float32).reshape(-1)
+        if x_obs_flat.shape[0] != 2:
+            raise ValueError(f"Expected 2D observation, got shape {x_obs_flat.shape}")
+        x0 = float(x_obs_flat[0].item())
+        x1 = float(x_obs_flat[1].item())
 
-        if x_obs_np.shape[0] != 2:
-            raise ValueError(f"Expected 2D observation, got shape {x_obs_np.shape}")
-        x0, x1 = x_obs_np[0], x_obs_np[1]
+        lo, hi = (-1.0, 1.0) if prior_bounds is None else prior_bounds
 
-        if prior_bounds is None:
-            prior_bounds = (-1.0, 1.0)
-        lo, hi = prior_bounds
-        base_offset = self.base_offset
-        r_loc, r_scale = self.r_loc, self.r_scale
-
-        # forward rotation angle and its inverse
-        ang = -np.pi / 4.0
-        c_inv, s_inv = np.cos(-ang), np.sin(-ang)  # R(-ang) = inverse rotation
-
-        out = []
+        out: list[torch.Tensor] = []
         collected = 0
+        max_attempts = 200
 
-        while collected < num_samples:
+        for _ in range(max_attempts):
+            if collected >= num_samples:
+                break
             batch = max(4 * (num_samples - collected), 4096)
 
-            # 1. sample from crescent base
-            a = np.random.uniform(self.a_low, self.a_high, size=batch)
-            r = np.random.normal(r_loc, r_scale, size=batch)
+            a = torch.empty(batch, dtype=torch.float32).uniform_(
+                self.a_low, self.a_high
+            )
+            r = self.r_loc + self.r_scale * torch.randn(batch, dtype=torch.float32)
 
-            p0 = np.cos(a) * r + base_offset
-            p1 = np.sin(a) * r
+            p0 = torch.cos(a) * r + self.base_offset
+            p1 = torch.sin(a) * r
 
-            # 2. solve for z0,z1 given x_obs
-            # x0_obs = p0 - |z0|  =>  |z0| = p0 - x0_obs  (must be >= 0)
-            # x1_obs = p1 + z1    =>  z1 = x1_obs - p1
             q0_abs = p0 - x0
             q1 = x1 - p1
 
-            # drop impossible latent points where |z0| would be negative
             valid = q0_abs >= 0.0
-            if not np.any(valid):
+            if not valid.any():
                 continue
 
             q0_abs = q0_abs[valid]
             q1 = q1[valid]
 
-            # 3. Random sign choice for z0 to represent both moon branches equally
-            signs = np.where(np.random.rand(len(q0_abs)) < 0.5, 1.0, -1.0)
+            signs = torch.where(torch.rand(q0_abs.shape[0]) < 0.5, 1.0, -1.0)
             q0 = signs * q0_abs
 
-            # 4. rotate back to theta: z = R(ang) theta => theta = R(-ang) z
-            theta1 = c_inv * q0 - s_inv * q1
-            theta2 = s_inv * q0 + c_inv * q1
-            theta = np.stack([theta1, theta2], axis=1)
+            theta1 = _COS_INV * q0 - _SIN_INV * q1
+            theta2 = _SIN_INV * q0 + _COS_INV * q1
+            theta = torch.stack([theta1, theta2], dim=1)
 
-            # 5. enforce prior support (uniform box)
             keep = (
                 (theta[:, 0] >= lo)
                 & (theta[:, 0] <= hi)
                 & (theta[:, 1] >= lo)
                 & (theta[:, 1] <= hi)
             )
-            theta = theta[keep]
+            accepted = theta[keep]
+            if accepted.shape[0] > 0:
+                out.append(accepted)
+                collected += accepted.shape[0]
 
-            if theta.shape[0] > 0:
-                out.append(theta)
-                collected += theta.shape[0]
+        if collected < num_samples:
+            raise RuntimeError(
+                f"TwoMoons posterior sampling failed to collect {num_samples} samples "
+                f"within [{lo}, {hi}] after {max_attempts} attempts (collected {collected})."
+            )
 
-        samples = np.concatenate(out, axis=0)
-        np.random.shuffle(samples)
-        return torch.as_tensor(samples[:num_samples], dtype=torch.float32)
+        samples = torch.cat(out, dim=0)
+        perm = torch.randperm(samples.shape[0])
+        return samples[perm[:num_samples]]
