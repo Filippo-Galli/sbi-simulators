@@ -5,6 +5,7 @@ import math
 
 import jax
 import jax.numpy as jnp
+import pyro.distributions as pdist
 import pytest
 import torch
 
@@ -16,12 +17,20 @@ from sbi_simulator import (
     BimodalGaussians,
     DoubleWell,
     GaussianGaussian,
+    GaussianGaussianPreset,
     LinearSDE,
+    LogNormalPrior,
     LotkaVolterra,
+    LVPreset,
+    NormalPrior,
     Simulator,
+    SIRPreset,
     SpikeSlab,
     TwoMoons,
     UniformGaussian,
+    UniformGaussianPreset,
+    UniformPrior,
+    as_prior_spec,
     extract_two_step_pairs,
 )
 from sbi_simulator.LinearSDE.simulator import matrix_fraction_decomposition
@@ -1001,3 +1010,144 @@ def test_linear_sde_kalman_exactness():
 
     assert jax.numpy.isfinite(ll_fast)
     assert abs(ll_fast - ll_ref) < 1e-4
+
+
+def test_prior_spec_pyro_roundtrip():
+    """Verify PriorSpec <-> Pyro conversion, hashing, and log-prob parity."""
+    specs = [
+        NormalPrior(loc=(0.5, -1.0, 2.0), scale=(0.25, 1.5, 0.8)),
+        UniformPrior(low=(-2.0, 0.1, -5.0), high=(1.0, 3.0, 0.0)),
+        LogNormalPrior(loc=(-0.5, 0.2), scale=(0.4, 0.7)),
+    ]
+    for spec in specs:
+        pyro_dist = spec.to_pyro()
+        roundtrip = as_prior_spec(pyro_dist)
+        assert type(roundtrip) is type(spec)
+        assert roundtrip.dim == spec.dim
+
+        # Float32 round-trip through Pyro tensors is idempotent and hash-consistent
+        second = as_prior_spec(roundtrip.to_pyro())
+        assert second == roundtrip
+        assert hash(second) == hash(roundtrip)
+
+        if isinstance(spec, UniformPrior) and isinstance(roundtrip, UniformPrior):
+            assert torch.allclose(torch.tensor(roundtrip.low), torch.tensor(spec.low), atol=1e-6)
+            assert torch.allclose(torch.tensor(roundtrip.high), torch.tensor(spec.high), atol=1e-6)
+        elif isinstance(spec, (NormalPrior, LogNormalPrior)) and isinstance(
+            roundtrip, (NormalPrior, LogNormalPrior)
+        ):
+            assert torch.allclose(torch.tensor(roundtrip.loc), torch.tensor(spec.loc), atol=1e-6)
+            assert torch.allclose(torch.tensor(roundtrip.scale), torch.tensor(spec.scale), atol=1e-6)
+
+        sample = pyro_dist.sample()
+        lp_pyro = float(pyro_dist.log_prob(sample).item())
+        lp_jax = float(spec.jax_log_prob(jnp.asarray(sample.numpy())))
+        assert abs(lp_pyro - lp_jax) < 1e-4
+
+
+def test_custom_data_driven_presets():
+    """Verify passing custom Preset dataclasses works with zero simulator edits."""
+    custom_lv = LVPreset(
+        dt=0.02,
+        inner_steps=5,
+        sigma1=0.0,
+        sigma2=0.0,
+        num_steps=11,
+        obs_sigma=0.05,
+        mode="ode",
+        u0=(2.0, 1.0),
+        summary=None,
+        param_transform="identity",
+        param_order="alphabetical",
+        prior=UniformPrior(low=(0.4, 0.1, 0.4, 0.1), high=(1.5, 0.8, 1.5, 0.8)),
+        prior_x0=UniformPrior.box(2, 0.5, 5.0),
+        canonical_theta=(0.8, 0.3, 0.9, 0.2),
+        default_step_size=0.05,
+    )
+    lv = LotkaVolterra(preset=custom_lv, seed=42)
+    assert lv.preset == "custom"
+    th_lv = lv.sample_prior(3)
+    assert th_lv.shape == (3, 4)
+    obs_lv = lv.simulate(lv.canonical_theta)
+    assert obs_lv.shape == (22,)
+    post_lv = lv.posterior_samples(
+        obs_lv, num_samples=20, n_chains=2, burn_in=10, inner_thin=1
+    )
+    assert post_lv.shape == (20, 4)
+    assert (post_lv[:, 0] >= 0.4).all() and (post_lv[:, 0] <= 1.5).all()
+    assert (post_lv[:, 1] >= 0.1).all() and (post_lv[:, 1] <= 0.8).all()
+
+    custom_sir = SIRPreset(
+        dt=0.01,
+        inner_steps=5,
+        sigma1=0.0,
+        num_steps=11,
+        obs_sigma=0.05,
+        mode="ode",
+        total_population=10.0,
+        u0=(8.0, 2.0, 0.0),
+        summary=None,
+        param_transform="identity",
+        param_order="paper",
+        prior=UniformPrior(low=(0.2, 0.05), high=(1.2, 0.6)),
+        prior_x0=UniformPrior.box(3, 0.0, 10.0),
+        canonical_theta=(0.6, 0.2),
+        default_step_size=0.05,
+    )
+    sir = SIR(preset=custom_sir, seed=42)
+    assert sir.preset == "custom"
+    obs_sir = sir.simulate(sir.canonical_theta)
+    assert obs_sir.shape == (33,)
+    post_sir = sir.posterior_samples(
+        obs_sir, num_samples=20, n_chains=2, burn_in=10, inner_thin=1
+    )
+    assert post_sir.shape == (20, 2)
+    assert (post_sir[:, 0] >= 0.2).all() and (post_sir[:, 0] <= 1.2).all()
+    assert (post_sir[:, 1] >= 0.05).all() and (post_sir[:, 1] <= 0.6).all()
+
+    custom_gg = GaussianGaussianPreset(prior_var=0.25, lik_var_range=(0.2, 0.8))
+    gg = GaussianGaussian(dim_parameters=4, preset=custom_gg, seed=42)
+    assert gg.preset == "custom"
+    diag_sig = gg._diag_sigma(4)
+    assert torch.allclose(diag_sig, torch.linspace(0.2, 0.8, steps=4))
+    x_obs_gg = torch.tensor([1.0, -1.0, 0.5, 2.0])
+    post_gg = gg.posterior_samples(x_obs_gg, num_samples=4000)
+    exp_var = 1.0 / (1.0 / 0.25 + 1.0 / diag_sig)
+    exp_mean = exp_var * (x_obs_gg / diag_sig)
+    assert torch.allclose(post_gg.mean(dim=0), exp_mean, atol=0.05)
+    assert torch.allclose(post_gg.var(dim=0), exp_var, atol=0.05)
+
+    custom_ug = UniformGaussianPreset(sigma=0.2, L=1.5)
+    ug = UniformGaussian(dim_parameters=4, preset=custom_ug, seed=42)
+    assert ug.preset == "custom"
+    assert ug.sigma == 0.2
+    assert ug.L == 1.5
+    post_ug = ug.posterior_samples(torch.zeros(4), num_samples=50)
+    assert (post_ug >= -1.5).all() and (post_ug <= 1.5).all()
+
+
+def test_custom_pyro_prior_syncs_with_jax_mcmc():
+    """Verify custom Pyro distributions sync across get_prior() and JAX MCMC."""
+    custom_sir_prior = pdist.Uniform(
+        torch.tensor([0.2, 0.05]), torch.tensor([0.6, 0.25])
+    ).to_event(1)
+    sir = SIR(preset="sbibm", prior=custom_sir_prior, seed=42)
+    obs = sir.simulate(sir.canonical_theta)
+    samples = sir.posterior_samples(
+        obs, num_samples=40, n_chains=2, burn_in=20, inner_thin=1
+    )
+    assert samples.shape == (40, 2)
+    assert torch.isfinite(samples).all()
+    assert (samples[:, 0] >= 0.2).all() and (samples[:, 0] <= 0.6).all()
+    assert (samples[:, 1] >= 0.05).all() and (samples[:, 1] <= 0.25).all()
+
+    custom_lv_prior = NormalPrior(
+        loc=(0.5, -0.5, 0.2, -0.2), scale=(0.3, 0.3, 0.3, 0.3)
+    )
+    lv = LotkaVolterra(mode="sde", prior=custom_lv_prior, seed=42)
+    obs_lv = lv.simulate(lv.canonical_theta)
+    samples_lv = lv.posterior_samples(
+        obs_lv, num_samples=20, n_chains=2, burn_in=10, inner_thin=1, n_particles=50
+    )
+    assert samples_lv.shape == (20, 4)
+    assert torch.isfinite(samples_lv).all()
