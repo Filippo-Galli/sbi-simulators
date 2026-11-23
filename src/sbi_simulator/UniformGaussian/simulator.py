@@ -9,6 +9,7 @@ Reference:
 
 from __future__ import annotations
 
+import math
 from typing import override
 
 import numpy as np
@@ -40,13 +41,23 @@ class UniformGaussian(Simulator):
         self,
         dim_parameters: int = 10,
         seed: int = 42,
-        sigma: float = 1.0,
+        sigma: float | None = None,
         dim_data: int | None = None,
         alpha: float = 0.99,
         L: float | None = None,
+        preset: str = "default",
         **kwargs,
     ):
-        self.sigma = float(sigma)
+        preset_key = preset.lower()
+        if preset_key not in ("default", "sbibm"):
+            raise ValueError(
+                f"Unknown preset '{preset}'. Supported presets are 'default' and 'sbibm'."
+            )
+        self.preset = preset_key
+        if sigma is None:
+            self.sigma = math.sqrt(0.1) if self.preset == "sbibm" else 1.0
+        else:
+            self.sigma = float(sigma)
         self.alpha = float(alpha)
 
         if dim_data is None:
@@ -60,6 +71,8 @@ class UniformGaussian(Simulator):
 
         if L is not None:
             self.L = float(L)
+        elif self.preset == "sbibm":
+            self.L = 1.0
         else:
             self.L = float(self.compute_prior_bound(self.dim_parameters, self.alpha))
 

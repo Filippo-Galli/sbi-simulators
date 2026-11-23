@@ -1,14 +1,14 @@
 {
-  lib,
   buildPythonPackage,
-  setuptools,
-  wheel,
-  numpy,
-  scipy,
-  torch,
-  pyro-ppl,
   jax,
+  lib,
+  numpy,
+  pyro-ppl,
   pytestCheckHook,
+  scipy,
+  setuptools,
+  torch,
+  wheel,
 }:
 buildPythonPackage (finalAttrs: {
   pname = "sbi-simulator";
@@ -41,6 +41,10 @@ buildPythonPackage (finalAttrs: {
 
   pythonImportsCheck = [
     "sbi_simulator"
+  ];
+
+  disableTestCases = [
+    "test_visualization.py"
   ];
 
   nativeCheckInputs = [

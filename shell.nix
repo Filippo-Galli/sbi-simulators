@@ -10,6 +10,8 @@ pkgs.mkShell {
     python3
     ruff
     ty
+    pkgs.python3Packages.corner
+    pkgs.python3Packages.numpy
   ];
 
   shellHook = ''

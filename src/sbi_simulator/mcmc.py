@@ -215,6 +215,12 @@ def build_ode_ll(
 def build_ode_mcmc_sampler(
     ode_ll_fn,
     dim_parameters: int,
+    prior_type: str = "gaussian",
+    prior_low: float = -5.0,
+    prior_high: float = 2.0,
+    prior_loc: jnp.ndarray | None = None,
+    prior_scale: jnp.ndarray | None = None,
+    default_init_theta: jnp.ndarray | None = None,
 ):
     """Build a JIT-compiled Metropolis-Hastings MCMC sampler in JAX for ODE models.
 
@@ -224,13 +230,50 @@ def build_ode_mcmc_sampler(
         Function `(theta, x_obs)` returning the scalar log-likelihood.
     dim_parameters : int
         Dimensionality of theta.
+    prior_type : str, optional
+        "gaussian" for N(0, I) prior, "uniform" for Uniform(prior_low, prior_high)^D,
+        or "lognormal" for LogNormal(prior_loc, prior_scale).
+    prior_low : float, optional
+        Lower bound for uniform prior.
+    prior_high : float, optional
+        Upper bound for uniform prior.
+    prior_loc : jnp.ndarray, optional
+        Mean of log(theta) for lognormal prior.
+    prior_scale : jnp.ndarray, optional
+        Std of log(theta) for lognormal prior.
+    default_init_theta : jnp.ndarray, optional
+        Default candidate parameter vector to seed MCMC initialization.
     """
     log_prior_norm = (dim_parameters / 2.0) * jnp.log(2.0 * jnp.pi)
+    if prior_type == "lognormal":
+        loc_arr = (
+            jnp.zeros(dim_parameters, dtype=jnp.float32)
+            if prior_loc is None
+            else jnp.asarray(prior_loc, dtype=jnp.float32)
+        )
+        scale_arr = (
+            jnp.ones(dim_parameters, dtype=jnp.float32)
+            if prior_scale is None
+            else jnp.asarray(prior_scale, dtype=jnp.float32)
+        )
+        log_ln_norm = jnp.sum(jnp.log(scale_arr)) + (dim_parameters / 2.0) * jnp.log(
+            2.0 * jnp.pi
+        )
 
-    def log_joint(theta, x_obs):
-        lp_prior = -0.5 * jnp.sum(theta**2) - log_prior_norm
-        ll = ode_ll_fn(theta, x_obs)
-        return lp_prior + ll
+    def log_joint(state_val, x_obs):
+        if prior_type == "uniform":
+            in_prior = jnp.all((state_val >= prior_low) & (state_val <= prior_high))
+            ll = ode_ll_fn(state_val, x_obs)
+            return jnp.where(in_prior, ll, -1e9)
+        elif prior_type == "lognormal":
+            # state_val is z = log(theta) ~ Normal(loc_arr, scale_arr)
+            lp_prior = -0.5 * jnp.sum(((state_val - loc_arr) / scale_arr) ** 2) - log_ln_norm
+            ll = ode_ll_fn(jnp.exp(state_val), x_obs)
+            return lp_prior + ll
+        else:
+            lp_prior = -0.5 * jnp.sum(state_val**2) - log_prior_norm
+            ll = ode_ll_fn(state_val, x_obs)
+            return lp_prior + ll
 
     v_log_joint = jax.vmap(log_joint, in_axes=(0, None))
 
@@ -258,7 +301,28 @@ def build_ode_mcmc_sampler(
         k_init, k_mcmc = jax.random.split(rng_key)
 
         def init_single_chain(k):
-            thetas_sir = jax.random.normal(k, shape=(n_sir, dim_parameters))
+            if default_init_theta is not None:
+                k1, _ = jax.random.split(k)
+                jitter = jax.random.normal(k1, shape=(dim_parameters,)) * 0.05
+                if prior_type == "lognormal":
+                    cand_th = jnp.log(jnp.maximum(default_init_theta, 1e-12)) + jitter
+                else:
+                    cand_th = default_init_theta + jitter
+                    if prior_type == "uniform":
+                        cand_th = jnp.clip(cand_th, prior_low, prior_high)
+                init_lp = log_joint(cand_th, x_obs)
+                return cand_th, init_lp
+            elif prior_type == "uniform":
+                thetas_sir = jax.random.uniform(
+                    k, shape=(n_sir, dim_parameters), minval=prior_low, maxval=prior_high
+                )
+            elif prior_type == "lognormal":
+                thetas_sir = (
+                    loc_arr
+                    + jax.random.normal(k, shape=(n_sir, dim_parameters)) * scale_arr
+                )
+            else:
+                thetas_sir = jax.random.normal(k, shape=(n_sir, dim_parameters))
             lps = v_log_joint(thetas_sir, x_obs)
             best_th = thetas_sir[jnp.argmax(lps)]
             init_lp = log_joint(best_th, x_obs)
@@ -292,6 +356,8 @@ def build_ode_mcmc_sampler(
             scan_step, (curr_thetas, curr_lp), keys
         )
         post_burnin = all_samples[burn_in:]
+        if prior_type == "lognormal":
+            post_burnin = jnp.exp(post_burnin)
         return post_burnin.transpose(1, 0, 2).reshape(-1, dim_parameters)
 
     return run_mcmc

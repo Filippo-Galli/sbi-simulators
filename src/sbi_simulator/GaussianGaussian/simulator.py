@@ -2,6 +2,7 @@
 reference: 'Compositional Score Modeling for Simulation-Based Inference'
 """
 
+import math
 from typing import override
 
 import pyro.distributions as pdist
@@ -11,13 +12,33 @@ from ..Simulator import Simulator
 
 
 class GaussianGaussian(Simulator):
+    """Simulator for the Gaussian-Gaussian / Gaussian Linear model.
+
+    Presets:
+    --------
+    - "default":
+      Configuration from 'Compositional Score Modeling for Simulation-Based Inference':
+      * Prior: N(0, I_d)
+      * Likelihood: N(x | theta, diag_sigma), variances linearly spaced in [0.6, 1.4]
+    - "sbibm" (Lueckmann et al., 2021, arXiv:2101.04653, Task 'gaussian_linear'):
+      * Prior: N(0, 0.1 * I_d)
+      * Likelihood: N(x | theta, 0.1 * I_d)
+    """
+
     def __init__(
         self,
         dim_parameters: int = 10,
         seed: int = 42,
         dim_data: int | None = None,
+        preset: str = "default",
         **kwargs,
     ):
+        preset_key = preset.lower()
+        if preset_key not in ("default", "sbibm"):
+            raise ValueError(
+                f"Unknown preset '{preset}'. Supported presets are 'default' and 'sbibm'."
+            )
+        self.preset = preset_key
         if dim_data is None:
             dim_data = dim_parameters
         super().__init__(
@@ -25,6 +46,8 @@ class GaussianGaussian(Simulator):
         )
 
     def _diag_sigma(self, dim: int) -> torch.Tensor:
+        if self.preset == "sbibm":
+            return torch.full((dim,), 0.1, dtype=torch.float32)
         # Variances scaling linearly from 0.6 to 1.4 across `dim` entries
         if dim == 1:
             return torch.tensor([0.6])
@@ -50,8 +73,10 @@ class GaussianGaussian(Simulator):
 
     @override
     def get_prior(self) -> pdist.Distribution:
+        std = math.sqrt(0.1) if self.preset == "sbibm" else 1.0
         return pdist.Normal(
-            torch.zeros(self.dim_parameters), torch.ones(self.dim_parameters)
+            torch.zeros(self.dim_parameters),
+            std * torch.ones(self.dim_parameters),
         ).to_event(1)
 
     def posterior_samples(
@@ -85,7 +110,8 @@ class GaussianGaussian(Simulator):
         diag_sigma = self._diag_sigma(dim)
         sigma_inv = torch.diag(1.0 / diag_sigma)
 
-        prior_precision = torch.eye(dim)
+        prior_var = 0.1 if self.preset == "sbibm" else 1.0
+        prior_precision = (1.0 / prior_var) * torch.eye(dim)
         posterior_precision = prior_precision + n_obs * sigma_inv
         posterior_cov = torch.linalg.inv(posterior_precision)
         posterior_mean = posterior_cov @ (sigma_inv @ x_obs_t.sum(dim=0))

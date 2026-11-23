@@ -709,3 +709,140 @@ def test_lotka_volterra_mode_and_prng():
     assert x_next_ode.shape == (1, 2)
     assert torch.isfinite(x_next_ode).all()
 
+
+def test_lotka_volterra_presets_and_kwargs():
+    """Verify LotkaVolterra presets ('markovsbi' and 'paper') and Simulator kwargs passing."""
+    # 1. Custom kwargs in base Simulator class
+    lv_custom = SIMULATORS["LotkaVolterra"](
+        preset="sbibm", custom_tag="experiment_1", note="test_kwargs"
+    )
+    assert lv_custom.kwargs.get("custom_tag") == "experiment_1"
+    assert lv_custom.kwargs.get("note") == "test_kwargs"
+
+    # 2. Preset "markovsbi" (default)
+    lv_m = SIMULATORS["LotkaVolterra"](preset="markovsbi")
+    assert lv_m.preset == "markovsbi"
+    assert lv_m.num_steps == 11
+    assert lv_m.dim_data == 22
+    assert lv_m.summary is None
+    assert lv_m.param_transform == "sigmoid"
+    assert torch.allclose(lv_m.u0, torch.tensor([1.0, 0.5]))
+    assert lv_m.mode == "sde"
+
+    # 3. Preset "sbibm" (Lueckmann et al., 2021, arXiv:2101.04653)
+    lv_p = SIMULATORS["LotkaVolterra"](preset="sbibm")
+    assert lv_p.preset == "sbibm"
+    assert lv_p.num_steps == 10
+    assert lv_p.dim_data == 20  # 10 time points x 2 species
+    assert lv_p.summary == "lognormal"
+    assert lv_p.param_transform == "identity"
+    assert lv_p.param_order == "alphabetical"
+    assert torch.allclose(lv_p.u0, torch.tensor([30.0, 1.0]))
+    assert lv_p.mode == "ode"
+
+    # Prior is LogNormal([-0.125, -3.0, -0.125, -3.0], 0.5)
+    th = lv_p.get_prior().sample((10,))
+    assert th.shape == (10, 4)
+    assert (th > 0.0).all()
+
+    # Simulate canonical theta*
+    out_paper = lv_p.simulate(lv_p.canonical_theta)
+    assert out_paper.shape == (20,)
+    assert torch.isfinite(out_paper).all()
+    assert (out_paper > 0.0).all()
+
+    # Posterior samples with paper preset in ODE mode
+    samples_paper = lv_p.posterior_samples(
+        out_paper, num_samples=20, n_chains=2, burn_in=10, inner_thin=1
+    )
+    assert samples_paper.shape == (20, 4)
+    assert torch.isfinite(samples_paper).all()
+    assert (samples_paper > 0.0).all()
+
+    # 4. Preset "papamakarios" (Papamakarios et al. 2019)
+    lv_snl = SIMULATORS["LotkaVolterra"](preset="papamakarios")
+    assert lv_snl.preset == "papamakarios"
+    assert lv_snl.num_steps == 151
+    assert lv_snl.dim_data == 9  # default summary="stats"
+    assert lv_snl.summary == "stats"
+    assert lv_snl.param_transform == "exp"
+    assert lv_snl.param_order == "paper"
+    assert torch.allclose(lv_snl.u0, torch.tensor([100.0, 50.0]))
+    assert lv_snl.mode == "ode"
+
+    # Prior is Uniform(-5, 2)^4
+    th_snl = lv_snl.get_prior().sample((10,))
+    assert th_snl.shape == (10, 4)
+    assert (th_snl >= -5.0).all() and (th_snl <= 2.0).all()
+
+    # Simulate canonical theta* (papamakarios ground truth)
+    out_stats = lv_snl.simulate(lv_snl.canonical_theta)
+    assert out_stats.shape == (9,)
+    assert torch.isfinite(out_stats).all()
+
+    # Papamakarios preset with raw trajectory (summary=None)
+    lv_snl_raw = SIMULATORS["LotkaVolterra"](preset="papamakarios", summary=None)
+    assert lv_snl_raw.dim_data == 302
+    out_raw = lv_snl_raw.simulate(lv_snl.canonical_theta)
+    assert out_raw.shape == (302,)
+    assert torch.isfinite(out_raw).all()
+
+    # Posterior samples with papamakarios preset in ODE mode
+    x_obs = lv_snl_raw.simulate(lv_snl.canonical_theta)
+    samples = lv_snl_raw.posterior_samples(
+        x_obs, num_samples=20, n_chains=2, burn_in=10, inner_thin=1
+    )
+    assert samples.shape == (20, 4)
+    assert torch.isfinite(samples).all()
+
+
+def test_sir_and_gaussian_paper_presets():
+    """Verify SIR, GaussianGaussian, and UniformGaussian 'paper' presets (arXiv:2101.04653)."""
+    # 1. SIR sbibm preset
+    sir_p = SIMULATORS["SIR"](preset="sbibm", seed=42)
+    assert sir_p.preset == "sbibm"
+    assert sir_p.num_steps == 10
+    assert sir_p.dim_data == 10
+    assert sir_p.summary == "binomial"
+    assert sir_p.param_transform == "identity"
+    assert sir_p.param_order == "paper"
+    assert sir_p.total_population == 1_000_000.0
+    assert torch.allclose(sir_p.u0, torch.tensor([999999.0, 1.0, 0.0]))
+    assert sir_p.mode == "ode"
+
+    th_sir = sir_p.get_prior().sample((10,))
+    assert th_sir.shape == (10, 2)
+    assert (th_sir > 0.0).all()
+
+    out_sir = sir_p.simulate(sir_p.canonical_theta)
+    assert out_sir.shape == (10,)
+    assert torch.isfinite(out_sir).all()
+    assert (out_sir >= 0.0).all() and (out_sir <= 1000.0).all()
+
+    samples_sir = sir_p.posterior_samples(
+        out_sir, num_samples=20, n_chains=2, burn_in=10, inner_thin=1
+    )
+    assert samples_sir.shape == (20, 2)
+    assert torch.isfinite(samples_sir).all()
+    assert (samples_sir > 0.0).all()
+
+    # 2. GaussianGaussian sbibm preset (gaussian_linear)
+    gg_p = SIMULATORS["GaussianGaussian"](preset="sbibm", seed=42)
+    assert gg_p.preset == "sbibm"
+    assert gg_p.dim_parameters == 10
+    assert torch.allclose(gg_p._diag_sigma(10), torch.full((10,), 0.1))
+    samples_gg = gg_p.posterior_samples(torch.zeros(10), num_samples=50)
+    assert samples_gg.shape == (50, 10)
+    assert torch.isfinite(samples_gg).all()
+
+    # 3. UniformGaussian sbibm preset (gaussian_linear_uniform)
+    ug_p = SIMULATORS["UniformGaussian"](preset="sbibm", seed=42)
+    assert ug_p.preset == "sbibm"
+    assert ug_p.dim_parameters == 10
+    assert ug_p.L == 1.0
+    assert abs(ug_p.sigma**2 - 0.1) < 1e-6
+    samples_ug = ug_p.posterior_samples(torch.zeros(10), num_samples=50)
+    assert samples_ug.shape == (50, 10)
+    assert (samples_ug >= -1.0).all() and (samples_ug <= 1.0).all()
+
+
