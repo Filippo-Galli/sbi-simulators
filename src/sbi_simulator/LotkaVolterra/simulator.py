@@ -10,6 +10,7 @@ import pyro
 import pyro.distributions as pdist
 import torch
 
+from ..base import Simulator
 from ..compositional import sample_two_step
 from ..mcmc import (
     build_gibbs_pmmh_sampler,
@@ -17,7 +18,6 @@ from ..mcmc import (
     build_ode_mcmc_sampler,
     build_particle_filter_ll,
 )
-from ..Simulator import Simulator
 
 
 def _build_lv_step_fn(
@@ -724,7 +724,7 @@ class LotkaVolterra(Simulator):
         )
 
     @override
-    def simulate(self, parameters: torch.Tensor) -> torch.Tensor:
+    def simulate(self, parameters: torch.Tensor | np.ndarray) -> torch.Tensor:
         parameters = torch.as_tensor(parameters, dtype=torch.float32)
 
         if parameters.numel() == 0:
@@ -875,6 +875,7 @@ class LotkaVolterra(Simulator):
         lls_jax = v_ll(params_jax, keys)
         return torch.from_numpy(np.array(lls_jax, copy=True))
 
+    @override
     def posterior_samples(
         self,
         x_obs: torch.Tensor | np.ndarray | None = None,
@@ -899,13 +900,6 @@ class LotkaVolterra(Simulator):
           evaluated on either the deterministic summary statistics or trajectory likelihood.
         - SDE Mode: Gibbs Particle Marginal Metropolis-Hastings (PMMH) sampler.
         """
-        if (
-            x_obs is None
-            and "num_samples" in kwargs
-            and isinstance(num_samples, (torch.Tensor, np.ndarray))
-        ):
-            x_obs, num_samples = num_samples, kwargs.get("num_samples", 1000)
-
         is_default_obs = x_obs is None
         if x_obs is None:
             if self.preset in ("sbibm", "papamakarios"):

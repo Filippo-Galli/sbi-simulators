@@ -6,7 +6,7 @@ import numpy as np
 import pyro.distributions as pdist
 import torch
 
-from ..Simulator import Simulator
+from ..base import Simulator
 
 
 class SpikeSlab(Simulator):
@@ -31,7 +31,7 @@ class SpikeSlab(Simulator):
         ).to_event(1)
 
     @override
-    def simulate(self, parameters: torch.Tensor) -> torch.Tensor:
+    def simulate(self, parameters: torch.Tensor | np.ndarray) -> torch.Tensor:
         params = torch.as_tensor(parameters, dtype=torch.float32)
         if params.numel() == 0:
             raise ValueError("Expected at least one parameter.")
@@ -47,6 +47,7 @@ class SpikeSlab(Simulator):
         out = params + std * torch.randn_like(params)
         return out.squeeze(0) if is_1d else out
 
+    @override
     def posterior_samples(
         self,
         x_obs: torch.Tensor | np.ndarray | None = None,
@@ -59,12 +60,6 @@ class SpikeSlab(Simulator):
             p(x|theta) = 0.5 N(x; theta, I) + 0.5 N(x; theta, 0.01 I),
             p(theta|x) ∝ [0.5 N(theta; x, I) + 0.5 N(theta; x, 0.01 I)] * I(theta in [-10, 10]^D).
         """
-        if (
-            x_obs is None
-            and "num_samples" in kwargs
-            and isinstance(num_samples, (torch.Tensor, np.ndarray))
-        ):
-            x_obs, num_samples = num_samples, kwargs.get("num_samples", 1000)
         if x_obs is None:
             x_obs = torch.zeros(self.dim_data, dtype=torch.float32)
 

@@ -5,10 +5,11 @@ reference: 'Compositional Score Modeling for Simulation-Based Inference'
 import math
 from typing import override
 
+import numpy as np
 import pyro.distributions as pdist
 import torch
 
-from ..Simulator import Simulator
+from ..base import Simulator
 
 
 class GaussianGaussian(Simulator):
@@ -54,7 +55,7 @@ class GaussianGaussian(Simulator):
         return 0.6 + torch.arange(dim, dtype=torch.float32) * (1.4 - 0.6) / (dim - 1)
 
     @override
-    def simulate(self, parameters: torch.Tensor) -> torch.Tensor:
+    def simulate(self, parameters: torch.Tensor | np.ndarray) -> torch.Tensor:
         params = torch.as_tensor(parameters, dtype=torch.float32)
         if params.numel() == 0:
             raise ValueError("Expected at least one parameter.")
@@ -79,9 +80,10 @@ class GaussianGaussian(Simulator):
             std * torch.ones(self.dim_parameters),
         ).to_event(1)
 
+    @override
     def posterior_samples(
         self,
-        x_obs: torch.Tensor | None = None,
+        x_obs: torch.Tensor | np.ndarray | None = None,
         num_samples: int = 1000,
         **kwargs,
     ) -> torch.Tensor:
@@ -93,12 +95,6 @@ class GaussianGaussian(Simulator):
             Sigma_post = (I + N * Sigma^-1)^-1
             mu_post    = Sigma_post @ Sigma^-1 @ sum_{i=1}^N x_i
         """
-        if (
-            x_obs is None
-            and "num_samples" in kwargs
-            and isinstance(num_samples, torch.Tensor)
-        ):
-            x_obs, num_samples = num_samples, kwargs.get("num_samples", 1000)
         if x_obs is None:
             x_obs = torch.zeros(self.dim_data, dtype=torch.float32)
 

@@ -2,7 +2,7 @@
 
 import torch
 
-from .Simulator import Simulator
+from .base import Simulator
 
 
 def extract_two_step_pairs(

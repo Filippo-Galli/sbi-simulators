@@ -10,8 +10,8 @@ import numpy as np
 import pyro.distributions as pdist
 import torch
 
+from ..base import Simulator
 from ..compositional import sample_two_step
-from ..Simulator import Simulator
 
 
 def _build_slcp_jax_sampler():
@@ -300,7 +300,7 @@ class SLCP(Simulator):
         return data.squeeze(0) if is_1d else data
 
     @override
-    def simulate(self, parameters: torch.Tensor) -> torch.Tensor:
+    def simulate(self, parameters: torch.Tensor | np.ndarray) -> torch.Tensor:
         parameters = torch.as_tensor(parameters, dtype=torch.float32)
         if parameters.numel() == 0:
             raise ValueError("Expected at least one parameter.")
@@ -345,6 +345,7 @@ class SLCP(Simulator):
         lls_jax = v_ll(params_jax)
         return torch.from_numpy(np.array(lls_jax, copy=True))
 
+    @override
     def posterior_samples(
         self,
         x_obs: torch.Tensor | np.ndarray | None = None,
@@ -403,13 +404,6 @@ class SLCP(Simulator):
         torch.Tensor
             Posterior parameter samples of shape `(num_samples, 5)`.
         """
-        if (
-            x_obs is None
-            and "num_samples" in kwargs
-            and isinstance(num_samples, (torch.Tensor, np.ndarray))
-        ):
-            x_obs, num_samples = num_samples, kwargs.get("num_samples", 1000)
-
         if x_obs is None:
             # Benchmark observation 1 from sbibm
             x_obs = torch.tensor(

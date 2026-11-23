@@ -17,7 +17,7 @@ import pyro.distributions as pdist
 import torch
 from scipy import stats
 
-from ..Simulator import Simulator
+from ..base import Simulator
 
 
 class UniformGaussian(Simulator):
@@ -140,6 +140,7 @@ class UniformGaussian(Simulator):
 
         return params + self.sigma * torch.randn_like(params)
 
+    @override
     def posterior_samples(
         self,
         x_obs: torch.Tensor | np.ndarray | None = None,
@@ -156,12 +157,6 @@ class UniformGaussian(Simulator):
         Returns:
             torch.Tensor of shape (num_samples, dim_parameters).
         """
-        if (
-            x_obs is None
-            and "num_samples" in kwargs
-            and isinstance(num_samples, (torch.Tensor, np.ndarray))
-        ):
-            x_obs, num_samples = num_samples, kwargs.get("num_samples", 1000)
         if x_obs is None:
             x_obs_t = self.default_x_obs.unsqueeze(0)
         else:

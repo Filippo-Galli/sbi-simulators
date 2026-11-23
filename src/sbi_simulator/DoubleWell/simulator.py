@@ -9,9 +9,9 @@ import numpy as np
 import pyro.distributions as pdist
 import torch
 
+from ..base import Simulator
 from ..compositional import sample_two_step
 from ..mcmc import build_gibbs_pmmh_sampler, build_particle_filter_ll
-from ..Simulator import Simulator
 
 
 def _build_double_well_step_fn(
@@ -341,7 +341,7 @@ class DoubleWell(Simulator):
         )
 
     @override
-    def simulate(self, parameters: torch.Tensor) -> torch.Tensor:
+    def simulate(self, parameters: torch.Tensor | np.ndarray) -> torch.Tensor:
         """Simulate trajectories given parameter tensor."""
         parameters = torch.as_tensor(parameters, dtype=torch.float32)
 
@@ -466,6 +466,7 @@ class DoubleWell(Simulator):
         lls_jax = v_ll(params_jax, keys)
         return torch.from_numpy(np.array(lls_jax, copy=True))
 
+    @override
     def posterior_samples(
         self,
         x_obs: torch.Tensor | np.ndarray | None = None,
@@ -521,13 +522,6 @@ class DoubleWell(Simulator):
         torch.Tensor
             Posterior samples of latent parameters $\tilde{\theta} \in \mathbb{R}^2$ with shape `(num_samples, 2)`.
         """
-        if (
-            x_obs is None
-            and "num_samples" in kwargs
-            and isinstance(num_samples, (torch.Tensor, np.ndarray))
-        ):
-            x_obs, num_samples = num_samples, kwargs.get("num_samples", 1000)
-
         if x_obs is None:
             # Default observation generated from theta = [0.0, 0.0] with seed 42
             x_obs = torch.tensor(

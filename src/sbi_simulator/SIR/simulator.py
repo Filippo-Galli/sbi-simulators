@@ -10,6 +10,7 @@ import pyro
 import pyro.distributions as pdist
 import torch
 
+from ..base import Simulator
 from ..compositional import sample_two_step
 from ..mcmc import (
     build_gibbs_pmmh_sampler,
@@ -17,7 +18,6 @@ from ..mcmc import (
     build_ode_mcmc_sampler,
     build_particle_filter_ll,
 )
-from ..Simulator import Simulator
 
 
 def _build_sir_step_fn(
@@ -647,7 +647,7 @@ class SIR(Simulator):
         )
 
     @override
-    def simulate(self, parameters: torch.Tensor) -> torch.Tensor:
+    def simulate(self, parameters: torch.Tensor | np.ndarray) -> torch.Tensor:
         parameters = torch.as_tensor(parameters, dtype=torch.float32)
 
         if parameters.numel() == 0:
@@ -808,6 +808,7 @@ class SIR(Simulator):
         lls_jax = v_ll(params_jax, keys)
         return torch.from_numpy(np.array(lls_jax, copy=True))
 
+    @override
     def posterior_samples(
         self,
         x_obs: torch.Tensor | np.ndarray | None = None,
@@ -866,13 +867,6 @@ class SIR(Simulator):
         torch.Tensor
             Posterior samples of latent parameters $\theta \in \mathbb{R}^2$ with shape `(num_samples, 2)`.
         """
-        if (
-            x_obs is None
-            and "num_samples" in kwargs
-            and isinstance(num_samples, (torch.Tensor, np.ndarray))
-        ):
-            x_obs, num_samples = num_samples, kwargs.get("num_samples", 1000)
-
         if x_obs is None:
             if self.preset == "sbibm":
                 th_star = self.canonical_theta

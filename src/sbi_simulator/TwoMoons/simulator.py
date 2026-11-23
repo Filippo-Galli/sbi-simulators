@@ -7,7 +7,7 @@ import numpy as np
 import pyro.distributions as pdist
 import torch
 
-from ..Simulator import Simulator
+from ..base import Simulator
 
 
 class TwoMoons(Simulator):
@@ -39,7 +39,7 @@ class TwoMoons(Simulator):
         return self.prior_dist
 
     @override
-    def simulate(self, parameters: torch.Tensor) -> torch.Tensor:
+    def simulate(self, parameters: torch.Tensor | np.ndarray) -> torch.Tensor:
         """Simulate one observation from parameters.
 
         Args:
@@ -73,6 +73,7 @@ class TwoMoons(Simulator):
 
         return p + torch.cat((-torch.abs(z0), z1), dim=1)
 
+    @override
     def posterior_samples(
         self,
         x_obs: torch.Tensor | np.ndarray | None = None,
@@ -91,12 +92,6 @@ class TwoMoons(Simulator):
         4. Rotate back to theta: theta = R(-ang) z.
         5. Keep only theta inside the uniform prior box [-1, 1]^2.
         """
-        if (
-            x_obs is None
-            and "num_samples" in kwargs
-            and isinstance(num_samples, (torch.Tensor, np.ndarray))
-        ):
-            x_obs, num_samples = num_samples, kwargs.get("num_samples", 1000)
         if x_obs is None:
             x_obs = torch.tensor([-0.6397, 0.1623], dtype=torch.float32)
 

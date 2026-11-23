@@ -4,10 +4,11 @@ import math
 import warnings
 from typing import override
 
+import numpy as np
 import pyro.distributions as pdist
 import torch
 
-from ..Simulator import Simulator
+from ..base import Simulator
 
 
 class AR1(Simulator):
@@ -62,7 +63,7 @@ class AR1(Simulator):
         return phi * y + self.sigma * torch.randn_like(y)
 
     @override
-    def simulate(self, parameters: torch.Tensor) -> torch.Tensor:
+    def simulate(self, parameters: torch.Tensor | np.ndarray) -> torch.Tensor:
         """Simulate AR(1) trajectories.
 
         Parameters
@@ -99,9 +100,10 @@ class AR1(Simulator):
 
         return out.squeeze(0) if is_1d else out
 
+    @override
     def posterior_samples(
         self,
-        x_obs: torch.Tensor | None = None,
+        x_obs: torch.Tensor | np.ndarray | None = None,
         num_samples: int = 1000,
         **kwargs,
     ) -> torch.Tensor:
@@ -110,14 +112,8 @@ class AR1(Simulator):
         Linear regression likelihood: y_t | y_{t-1}, phi ~ N(phi * y_{t-1}, sigma^2).
         Conjugate posterior: phi | y ~ N(mu_post, sigma_post^2).
         """
-        if (
-            x_obs is None
-            and "num_samples" in kwargs
-            and isinstance(num_samples, torch.Tensor)
-        ):
-            x_obs, num_samples = num_samples, kwargs.get("num_samples", 1000)
         if x_obs is None:
-            warnings.warn("x_obs is None, using zeros as placeholder")
+            warnings.warn("x_obs is None, using zeros as placeholder", stacklevel=2)
             x_obs = torch.zeros(self.dim_data, dtype=torch.float32)
 
         x_obs_t = torch.as_tensor(x_obs, dtype=torch.float32)

@@ -1,9 +1,10 @@
 from typing import override
 
+import numpy as np
 import torch
 from pyro import distributions as pdist
 
-from ..Simulator import Simulator
+from ..base import Simulator
 
 
 class BimodalGaussians(Simulator):
@@ -23,6 +24,7 @@ class BimodalGaussians(Simulator):
             seed=seed, dim_parameters=dim_parameters, dim_data=dim_data, **kwargs
         )
 
+    @override
     def get_prior(self) -> pdist.Distribution:
         return pdist.Uniform(
             -10.0 * torch.ones(self.dim_parameters),
@@ -30,7 +32,7 @@ class BimodalGaussians(Simulator):
         ).to_event(1)
 
     @override
-    def simulate(self, parameters: torch.Tensor) -> torch.Tensor:
+    def simulate(self, parameters: torch.Tensor | np.ndarray) -> torch.Tensor:
         params = torch.as_tensor(parameters, dtype=torch.float32)
         if params.numel() == 0:
             raise ValueError("Expected at least one parameter.")
@@ -47,9 +49,10 @@ class BimodalGaussians(Simulator):
         out = params + signs * self.shift + self.sigma * torch.randn_like(params)
         return out.squeeze(0) if is_1d else out
 
+    @override
     def posterior_samples(
         self,
-        x_obs: torch.Tensor | None = None,
+        x_obs: torch.Tensor | np.ndarray | None = None,
         num_samples: int = 1000,
         **kwargs,
     ) -> torch.Tensor:
@@ -57,12 +60,6 @@ class BimodalGaussians(Simulator):
         For an observation x_obs, the posterior is a symmetric mixture of two Gaussians
         centered at x_obs - shift and x_obs + shift, truncated to [-10, 10]^d.
         """
-        if (
-            x_obs is None
-            and "num_samples" in kwargs
-            and isinstance(num_samples, torch.Tensor)
-        ):
-            x_obs, num_samples = num_samples, kwargs.get("num_samples", 1000)
         if x_obs is None:
             x_obs = torch.zeros(self.dim_data, dtype=torch.float32)
 

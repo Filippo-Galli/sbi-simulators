@@ -1,13 +1,13 @@
 """sbi-simulator: Benchmark simulation models for Simulation-Based Inference."""
 
 from .AR1 import AR1
+from .base import Simulator
 from .BimodalGaussians import BimodalGaussians
 from .compositional import extract_two_step_pairs, sample_two_step
 from .DoubleWell import DoubleWell
 from .GaussianGaussian import GaussianGaussian
 from .LinearSDE import LinearSDE
 from .LotkaVolterra import LotkaVolterra
-from .Simulator import Simulator
 from .SIR import SIR
 from .SLCP import SLCP
 from .SpikeSlab import SpikeSlab

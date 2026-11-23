@@ -7,7 +7,7 @@ name = "sbi-simulator"
 version = "0.2.2"
 description = "Simulation-based inference (SBI) benchmark simulators"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = { text = "GPLv3" }
 authors = [
     { name = "Filippo Galli", email = "filippo.galli.cr@gmail.com" }

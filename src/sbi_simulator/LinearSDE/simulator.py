@@ -10,8 +10,8 @@ import pyro.distributions as pdist
 import torch
 from jax.scipy.linalg import expm
 
+from ..base import Simulator
 from ..compositional import sample_two_step
-from ..Simulator import Simulator
 
 
 def matrix_fraction_decomposition(dt: float, A: jax.Array, B: jax.Array):
@@ -456,7 +456,7 @@ class LinearSDE(Simulator):
         )
 
     @override
-    def simulate(self, parameters: torch.Tensor) -> torch.Tensor:
+    def simulate(self, parameters: torch.Tensor | np.ndarray) -> torch.Tensor:
         """Simulate trajectories given parameter tensor."""
         parameters = torch.as_tensor(parameters, dtype=torch.float32)
 
@@ -573,6 +573,7 @@ class LinearSDE(Simulator):
         lls_jax = v_ll(params_jax)
         return torch.from_numpy(np.array(lls_jax, copy=True))
 
+    @override
     def posterior_samples(
         self,
         x_obs: torch.Tensor | np.ndarray | None = None,
@@ -621,13 +622,6 @@ class LinearSDE(Simulator):
         torch.Tensor
             Posterior samples of parameters $\theta$ with shape `(num_samples, dim_parameters)`.
         """
-        if (
-            x_obs is None
-            and "num_samples" in kwargs
-            and isinstance(num_samples, (torch.Tensor, np.ndarray))
-        ):
-            x_obs, num_samples = num_samples, kwargs.get("num_samples", 1000)
-
         if x_obs is None:
             # Default observation generated from theta = [1.0, 1.0] with seed 42
             x_obs = torch.tensor(
