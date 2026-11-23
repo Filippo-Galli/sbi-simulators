@@ -1,3 +1,3 @@
-from .simulator import LotkaVolterra
+from .simulator import LV_PRESETS, LotkaVolterra, LVPreset
 
-__all__ = ["LotkaVolterra"]
+__all__ = ["LV_PRESETS", "LVPreset", "LotkaVolterra"]

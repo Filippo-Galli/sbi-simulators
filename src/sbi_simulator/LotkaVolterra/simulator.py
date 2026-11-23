@@ -20,7 +20,13 @@ from ..mcmc import (
     build_ode_ll,
     build_particle_filter_ll,
 )
-from ..priors import LogNormalPrior, NormalPrior, PriorSpec, UniformPrior
+from ..priors import (
+    LogNormalPrior,
+    NormalPrior,
+    PriorSpec,
+    UniformPrior,
+    as_prior_spec,
+)
 from ..summary_stats import trajectory_stats_2d_lv
 
 
@@ -30,9 +36,25 @@ class _UnsetType:
 
 _UNSET = _UnsetType()
 
+_MARKOVSBI_DEFAULT_X_OBS: tuple[tuple[float, float], ...] = (
+    (1.0000, 0.5000),
+    (1.0762, 0.5163),
+    (1.1869, 0.5604),
+    (1.2694, 0.5928),
+    (1.4117, 0.6073),
+    (1.5249, 0.6987),
+    (1.6904, 0.7705),
+    (1.7563, 0.8746),
+    (1.7599, 1.0564),
+    (1.7599, 1.3159),
+    (1.7551, 1.5372),
+)
+
 
 @dataclass(frozen=True)
-class _LVPreset:
+class LVPreset:
+    """Declarative configuration for a Lotka-Volterra benchmark variant."""
+
     dt: float
     inner_steps: int
     sigma1: float
@@ -44,15 +66,15 @@ class _LVPreset:
     summary: str | None
     param_transform: str
     param_order: str
-    prior_type: str
-    prior_loc: tuple[float, ...] | None = None
-    prior_scale: tuple[float, ...] | None = None
-    prior_low: float | None = None
-    prior_high: float | None = None
+    prior: PriorSpec
+    prior_x0: PriorSpec
+    canonical_theta: tuple[float, float, float, float]
+    default_step_size: float
+    default_x_obs: tuple[tuple[float, float], ...] | None = None
 
 
-_LV_PRESETS: dict[str, _LVPreset] = {
-    "markovsbi": _LVPreset(
+LV_PRESETS: dict[str, LVPreset] = {
+    "markovsbi": LVPreset(
         dt=0.02,
         inner_steps=5,
         sigma1=0.1,
@@ -64,9 +86,13 @@ _LV_PRESETS: dict[str, _LVPreset] = {
         summary=None,
         param_transform="sigmoid",
         param_order="alphabetical",
-        prior_type="gaussian",
+        prior=NormalPrior.isotropic(4),
+        prior_x0=UniformPrior.box(2, 0.0, 10.0),
+        canonical_theta=(0.0, 0.0, 0.0, 0.0),
+        default_step_size=0.3,
+        default_x_obs=_MARKOVSBI_DEFAULT_X_OBS,
     ),
-    "sbibm": _LVPreset(
+    "sbibm": LVPreset(
         dt=20.0 / 9.0 / 200.0,
         inner_steps=200,
         sigma1=0.0,
@@ -78,11 +104,20 @@ _LV_PRESETS: dict[str, _LVPreset] = {
         summary="lognormal",
         param_transform="identity",
         param_order="alphabetical",
-        prior_type="lognormal",
-        prior_loc=(-0.125, -3.0, -0.125, -3.0),
-        prior_scale=(0.5, 0.5, 0.5, 0.5),
+        prior=LogNormalPrior(
+            loc=(-0.125, -3.0, -0.125, -3.0),
+            scale=(0.5, 0.5, 0.5, 0.5),
+        ),
+        prior_x0=UniformPrior.box(2, 0.0, 200.0),
+        canonical_theta=(
+            math.exp(-0.125),
+            math.exp(-3.0),
+            math.exp(-0.125),
+            math.exp(-3.0),
+        ),
+        default_step_size=0.05,
     ),
-    "papamakarios": _LVPreset(
+    "papamakarios": LVPreset(
         dt=0.01,
         inner_steps=20,
         sigma1=0.0,
@@ -94,11 +129,14 @@ _LV_PRESETS: dict[str, _LVPreset] = {
         summary="stats",
         param_transform="exp",
         param_order="paper",
-        prior_type="uniform",
-        prior_low=-5.0,
-        prior_high=2.0,
+        prior=UniformPrior.box(4, -5.0, 2.0),
+        prior_x0=UniformPrior.box(2, 0.0, 200.0),
+        canonical_theta=(-4.605170, -0.693147, 0.0, -4.605170),
+        default_step_size=0.015,
     ),
 }
+
+_LV_PRESET_ALIASES: dict[str, str] = {"snl": "papamakarios"}
 
 
 def _build_lv_step_fn(
@@ -326,11 +364,7 @@ def _get_lv_mcmc_bundle(
     param_order: str,
     default_x0: tuple[float, float],
     ll_kind: str,
-    prior_type: str,
-    prior_low: float,
-    prior_high: float,
-    prior_loc: tuple[float, ...] | None,
-    prior_scale: tuple[float, ...] | None,
+    prior_spec: PriorSpec,
     default_init_theta: tuple[float, ...],
 ):
     """Build and cache Lotka-Volterra JAX MCMC sampler and batched likelihood."""
@@ -347,13 +381,6 @@ def _get_lv_mcmc_bundle(
             obs_sigma,
             ll_kind,
         )
-        prior_spec: PriorSpec
-        if prior_type == "lognormal" and prior_loc is not None and prior_scale is not None:
-            prior_spec = LogNormalPrior(loc=prior_loc, scale=prior_scale)
-        elif prior_type == "uniform":
-            prior_spec = UniformPrior.box(4, prior_low, prior_high)
-        else:
-            prior_spec = NormalPrior.isotropic(4)
         jax_mcmc = build_mh_mcmc_sampler(
             ll_fn,
             prior=prior_spec,
@@ -374,18 +401,31 @@ def _get_lv_mcmc_bundle(
     )
     pf_ll_fn = build_particle_filter_ll(step_fn, obs_dim=2, obs_sigma=obs_sigma)
     v_ll_fn = build_batched_ll(pf_ll_fn, stochastic=True)
-    jax_mcmc = build_gibbs_pmmh_sampler(pf_ll_fn, prior=NormalPrior.isotropic(4))
+    jax_mcmc = build_gibbs_pmmh_sampler(pf_ll_fn, prior=prior_spec)
     return v_ll_fn, jax_mcmc
+
+
+def _reorder_lv_canonical(
+    canonical: tuple[float, float, float, float],
+    src_order: str,
+    dst_order: str,
+) -> tuple[float, float, float, float]:
+    if src_order == dst_order:
+        return canonical
+    d, g, a, b = canonical if src_order == "paper" else (
+        canonical[3],
+        canonical[2],
+        canonical[0],
+        canonical[1],
+    )
+    return (d, g, a, b) if dst_order == "paper" else (a, b, g, d)
 
 
 class LotkaVolterra(DynamicalSimulator):
     r"""Lotka-Volterra Predator-Prey Simulator (SDE and ODE modes, with presets).
 
-    Presets:
-    --------
-    - ``"markovsbi"`` (default): SDE mode with shifted-sigmoid rates in ``(1, 3)`` and ``N(0, I_4)`` prior.
-    - ``"sbibm"``: ODE mode matching Lueckmann et al. (2021) with LogNormal prior and ``"lognormal"`` obs.
-    - ``"papamakarios"`` (alias ``"snl"``): ODE mode matching Papamakarios et al. (2019) with Uniform(-5, 2)^4 prior and 9 summary stats.
+    Presets may be passed as a registered name (``"markovsbi"``, ``"sbibm"``,
+    ``"papamakarios"`` / ``"snl"``) or directly as an :class:`LVPreset` data object.
     """
 
     def __init__(
@@ -400,9 +440,9 @@ class LotkaVolterra(DynamicalSimulator):
         obs_sigma: float | None = None,
         summary: str | None | _UnsetType = _UNSET,
         mode: str | None = None,
-        preset: str = "markovsbi",
+        preset: str | LVPreset = "markovsbi",
         u0: torch.Tensor | None = None,
-        prior: pdist.Distribution | None = None,
+        prior: PriorSpec | pdist.Distribution | None = None,
         param_transform: str | None = None,
         param_order: str | None = None,
         **kwargs,
@@ -413,15 +453,18 @@ class LotkaVolterra(DynamicalSimulator):
                 f"gamma, delta), got {dim_parameters}."
             )
 
-        preset_key = preset.lower()
-        if preset_key == "snl":
-            preset_key = "papamakarios"
-        if preset_key not in _LV_PRESETS:
-            raise ValueError(
-                f"Unknown preset '{preset}'. Supported presets are 'markovsbi', 'sbibm', and 'papamakarios'."
-            )
-        cfg = _LV_PRESETS[preset_key]
-        self.preset = preset_key
+        if isinstance(preset, LVPreset):
+            cfg = preset
+            self.preset = "custom"
+        else:
+            preset_key = _LV_PRESET_ALIASES.get(preset.lower(), preset.lower())
+            if preset_key not in LV_PRESETS:
+                raise ValueError(
+                    f"Unknown preset '{preset}'. Supported presets: {', '.join(LV_PRESETS)}."
+                )
+            cfg = LV_PRESETS[preset_key]
+            self.preset = preset_key
+        self.preset_config = cfg
 
         self.dt = float(cfg.dt if dt is None else dt)
         self.inner_steps = int(cfg.inner_steps if inner_steps is None else inner_steps)
@@ -473,37 +516,26 @@ class LotkaVolterra(DynamicalSimulator):
             **kwargs,
         )
 
-        if prior is not None:
-            self.prior_dist = prior
-            self.canonical_theta = torch.zeros(4, dtype=torch.float32)
-        elif self.preset == "sbibm":
-            assert cfg.prior_loc is not None and cfg.prior_scale is not None
-            self.prior_dist = pdist.LogNormal(
-                loc=torch.tensor(cfg.prior_loc, dtype=torch.float32),
-                scale=torch.tensor(cfg.prior_scale, dtype=torch.float32),
-            ).to_event(1)
-            self.canonical_theta = torch.exp(
-                torch.tensor(cfg.prior_loc, dtype=torch.float32)
+        prior_spec = cfg.prior if prior is None else as_prior_spec(prior)
+        if prior_spec.dim != dim_parameters:
+            raise ValueError(
+                f"Expected prior of dimension {dim_parameters}, got {prior_spec.dim}."
             )
-        elif self.preset == "papamakarios":
-            self.prior_dist = pdist.Uniform(
-                low=torch.full((4,), -5.0, dtype=torch.float32),
-                high=torch.full((4,), 2.0, dtype=torch.float32),
-            ).to_event(1)
-            if self.param_order == "paper":
-                self.canonical_theta = torch.tensor(
-                    [-4.605170, -0.693147, 0.0, -4.605170], dtype=torch.float32
-                )
-            else:
-                self.canonical_theta = torch.tensor(
-                    [0.0, -4.605170, -0.693147, -4.605170], dtype=torch.float32
-                )
+        self.prior_spec = prior_spec
+        self.prior_dist = prior_spec.to_pyro()
+        self._prior_x0_dist = cfg.prior_x0.to_pyro()
+        self.default_step_size = float(cfg.default_step_size)
+        self._default_x_obs = cfg.default_x_obs
+
+        if prior is not None:
+            self.canonical_theta = torch.tensor(
+                prior_spec.canonical_point(), dtype=torch.float32
+            )
         else:
-            self.prior_dist = pdist.Normal(
-                loc=torch.zeros(4, dtype=torch.float32),
-                scale=torch.ones(4, dtype=torch.float32),
-            ).to_event(1)
-            self.canonical_theta = torch.zeros(4, dtype=torch.float32)
+            canon = _reorder_lv_canonical(
+                cfg.canonical_theta, cfg.param_order, self.param_order
+            )
+            self.canonical_theta = torch.tensor(canon, dtype=torch.float32)
 
         self._u0_tuple = u0_tuple
         _, self._jax_solver_batch, _ = _get_lv_solver_bundle(
@@ -539,21 +571,13 @@ class LotkaVolterra(DynamicalSimulator):
             self.param_order,
             self._u0_tuple,
             ll_kind,
-            cfg.prior_type,
-            cfg.prior_low if cfg.prior_low is not None else -5.0,
-            cfg.prior_high if cfg.prior_high is not None else 2.0,
-            cfg.prior_loc,
-            cfg.prior_scale,
+            self.prior_spec,
             canon_tuple,
         )
 
     def get_prior_x0(self) -> pdist.Distribution:
         """Prior over initial condition ``x0 = [prey, predator]``."""
-        high = 200.0 if self.preset in ("sbibm", "papamakarios") else 10.0
-        return pdist.Uniform(
-            low=torch.zeros(2, dtype=torch.float32),
-            high=torch.full((2,), high, dtype=torch.float32),
-        ).to_event(1)
+        return self._prior_x0_dist
 
     @staticmethod
     @override
@@ -722,38 +746,20 @@ class LotkaVolterra(DynamicalSimulator):
         burn_in: int = 200,
         inner_thin: int = 4,
         n_particles: int = 150,
-        step_size: float = 0.3,
+        step_size: float | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Sample from ``p(theta | y_{1:T})`` using JAX MCMC / Gibbs PMMH."""
         is_default_obs = x_obs is None
         if x_obs is None:
-            if self.preset in ("sbibm", "papamakarios"):
-                th_star = self.canonical_theta
-                if self.summary in ("stats", "summary_stats", "lognormal"):
-                    x_obs = self.simulate(th_star)
-                else:
-                    x_obs = self._solve(
-                        th_star.unsqueeze(0), u0=self.u0.unsqueeze(0)
-                    )[0].T
+            if self._default_x_obs is not None:
+                x_obs = torch.tensor(self._default_x_obs, dtype=torch.float32)
+            elif self.summary in ("stats", "summary_stats", "lognormal"):
+                x_obs = self.simulate(self.canonical_theta)
             else:
-                # Default observation generated from theta = 0 with seed 42 (markovsbi)
-                x_obs = torch.tensor(
-                    [
-                        [1.0000, 0.5000],
-                        [1.0762, 0.5163],
-                        [1.1869, 0.5604],
-                        [1.2694, 0.5928],
-                        [1.4117, 0.6073],
-                        [1.5249, 0.6987],
-                        [1.6904, 0.7705],
-                        [1.7563, 0.8746],
-                        [1.7599, 1.0564],
-                        [1.7599, 1.3159],
-                        [1.7551, 1.5372],
-                    ],
-                    dtype=torch.float32,
-                )
+                x_obs = self._solve(
+                    self.canonical_theta.unsqueeze(0), u0=self.u0.unsqueeze(0)
+                )[0].T
 
         if self.mode == "ode":
             x_jax, _ = self._prepare_ode_obs(x_obs)
@@ -762,17 +768,13 @@ class LotkaVolterra(DynamicalSimulator):
 
         rng_key = (
             jax.random.PRNGKey(self.seed)
-            if (self.preset == "markovsbi" and is_default_obs)
+            if (is_default_obs and self._default_x_obs is not None)
             else self._next_rng_key()
         )
         num_samples_per_chain = math.ceil(num_samples / n_chains)
-
-        if self.preset == "papamakarios" and step_size == 0.3:
-            eff_step_size = 0.015
-        elif self.preset == "sbibm" and step_size == 0.3:
-            eff_step_size = 0.05
-        else:
-            eff_step_size = step_size
+        eff_step_size = (
+            self.default_step_size if step_size is None else float(step_size)
+        )
 
         if self.mode == "ode":
             samples_jax = self._jax_mcmc(

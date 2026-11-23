@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import override
@@ -30,6 +31,10 @@ class PriorSpec(ABC):
     @abstractmethod
     def jax_sample_unconstrained(self, key: jax.Array, count: int) -> jax.Array:
         """Draw ``count`` unconstrained samples of shape ``(count, dim)`` in JAX."""
+
+    @abstractmethod
+    def canonical_point(self) -> tuple[float, ...]:
+        """Return a representative point inside the prior support."""
 
     def to_unconstrained(self, theta: jax.Array) -> jax.Array:
         """Map constrained parameter ``theta`` into unconstrained sampler space."""
@@ -98,6 +103,10 @@ class NormalPrior(PriorSpec):
         scale_arr = jnp.asarray(self.scale, dtype=jnp.float32)
         return loc_arr + jax.random.normal(key, shape=(count, self.dim)) * scale_arr
 
+    @override
+    def canonical_point(self) -> tuple[float, ...]:
+        return self.loc
+
 
 @dataclass(frozen=True)
 class UniformPrior(PriorSpec):
@@ -156,6 +165,12 @@ class UniformPrior(PriorSpec):
         high_arr = jnp.asarray(self.high, dtype=jnp.float32)
         return jnp.clip(z, low_arr, high_arr)
 
+    @override
+    def canonical_point(self) -> tuple[float, ...]:
+        return tuple(
+            0.5 * (lo + hi) for lo, hi in zip(self.low, self.high, strict=True)
+        )
+
 
 @dataclass(frozen=True)
 class LogNormalPrior(PriorSpec):
@@ -211,6 +226,10 @@ class LogNormalPrior(PriorSpec):
         pos = jnp.all(theta > 0.0)
         z = jnp.log(jnp.maximum(theta, 1e-12))
         return jnp.where(pos, self.jax_log_prob_unconstrained(z) - jnp.sum(z), -jnp.inf)
+
+    @override
+    def canonical_point(self) -> tuple[float, ...]:
+        return tuple(math.exp(m) for m in self.loc)
 
 
 def _tensor_to_tuple(t: torch.Tensor, batch_shape: torch.Size) -> tuple[float, ...]:

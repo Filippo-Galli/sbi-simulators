@@ -1,3 +1,11 @@
-from .simulator import GaussianGaussian
+from .simulator import (
+    GAUSSIAN_GAUSSIAN_PRESETS,
+    GaussianGaussian,
+    GaussianGaussianPreset,
+)
 
-__all__ = ["GaussianGaussian"]
+__all__ = [
+    "GAUSSIAN_GAUSSIAN_PRESETS",
+    "GaussianGaussian",
+    "GaussianGaussianPreset",
+]

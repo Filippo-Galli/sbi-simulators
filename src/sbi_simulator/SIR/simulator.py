@@ -20,7 +20,13 @@ from ..mcmc import (
     build_ode_ll,
     build_particle_filter_ll,
 )
-from ..priors import LogNormalPrior, NormalPrior
+from ..priors import (
+    LogNormalPrior,
+    NormalPrior,
+    PriorSpec,
+    UniformPrior,
+    as_prior_spec,
+)
 from ..summary_stats import trajectory_stats_3d_sir
 
 
@@ -30,9 +36,25 @@ class _UnsetType:
 
 _UNSET = _UnsetType()
 
+_MARKOVSBI_DEFAULT_X_OBS: tuple[tuple[float, float, float], ...] = (
+    (4.0000000, 1.0000000, 0.0000000),
+    (3.7881465, 1.1751375, 0.0533900),
+    (3.5549567, 1.3938990, 0.1153643),
+    (3.2974174, 1.5862643, 0.1903032),
+    (3.0364633, 1.7333066, 0.2691698),
+    (2.7711196, 1.9520751, 0.3586609),
+    (2.5065825, 2.1024864, 0.4649960),
+    (2.2470863, 2.2430851, 0.5757274),
+    (1.9985336, 2.4134316, 0.6894845),
+    (1.7609777, 2.6007223, 0.8086434),
+    (1.5459836, 2.6992354, 0.9370170),
+)
+
 
 @dataclass(frozen=True)
-class _SIRPreset:
+class SIRPreset:
+    """Declarative configuration for an SIR benchmark variant."""
+
     dt: float
     inner_steps: int
     sigma1: float
@@ -44,13 +66,15 @@ class _SIRPreset:
     summary: str | None
     param_transform: str
     param_order: str
-    prior_type: str
-    prior_loc: tuple[float, ...] | None = None
-    prior_scale: tuple[float, ...] | None = None
+    prior: PriorSpec
+    prior_x0: PriorSpec
+    canonical_theta: tuple[float, float]
+    default_step_size: float
+    default_x_obs: tuple[tuple[float, float, float], ...] | None = None
 
 
-_SIR_PRESETS: dict[str, _SIRPreset] = {
-    "markovsbi": _SIRPreset(
+SIR_PRESETS: dict[str, SIRPreset] = {
+    "markovsbi": SIRPreset(
         dt=0.01,
         inner_steps=5,
         sigma1=0.1,
@@ -62,9 +86,13 @@ _SIR_PRESETS: dict[str, _SIRPreset] = {
         summary=None,
         param_transform="sigmoid",
         param_order="alphabetical",
-        prior_type="gaussian",
+        prior=NormalPrior.isotropic(2),
+        prior_x0=UniformPrior.box(3, 0.0, 5.0),
+        canonical_theta=(0.0, 0.0),
+        default_step_size=0.1,
+        default_x_obs=_MARKOVSBI_DEFAULT_X_OBS,
     ),
-    "sbibm": _SIRPreset(
+    "sbibm": SIRPreset(
         dt=160.0 / 9.0 / 200.0,
         inner_steps=200,
         sigma1=0.0,
@@ -76,9 +104,13 @@ _SIR_PRESETS: dict[str, _SIRPreset] = {
         summary="binomial",
         param_transform="identity",
         param_order="paper",
-        prior_type="lognormal",
-        prior_loc=(math.log(0.4), math.log(1.0 / 8.0)),
-        prior_scale=(0.5, 0.2),
+        prior=LogNormalPrior(
+            loc=(math.log(0.4), math.log(1.0 / 8.0)),
+            scale=(0.5, 0.2),
+        ),
+        prior_x0=UniformPrior.box(3, 0.0, 5.0),
+        canonical_theta=(0.4, 1.0 / 8.0),
+        default_step_size=0.1,
     ),
 }
 
@@ -246,9 +278,7 @@ def _get_sir_mcmc_bundle(
     param_order: str,
     default_x0: tuple[float, float, float],
     ll_kind: str,
-    prior_type: str,
-    prior_loc: tuple[float, ...] | None,
-    prior_scale: tuple[float, ...] | None,
+    prior_spec: PriorSpec,
     default_init_theta: tuple[float, ...],
 ):
     """Build and cache SIR JAX MCMC sampler and batched likelihood."""
@@ -266,10 +296,6 @@ def _get_sir_mcmc_bundle(
             binomial_n,
             ll_kind,
         )
-        if prior_type == "lognormal" and prior_loc is not None and prior_scale is not None:
-            prior_spec = LogNormalPrior(loc=prior_loc, scale=prior_scale)
-        else:
-            prior_spec = NormalPrior.isotropic(2)
         jax_mcmc = build_mh_mcmc_sampler(
             ll_fn,
             prior=prior_spec,
@@ -290,17 +316,15 @@ def _get_sir_mcmc_bundle(
     )
     pf_ll_fn = build_particle_filter_ll(step_fn, obs_dim=3, obs_sigma=obs_sigma)
     v_ll_fn = build_batched_ll(pf_ll_fn, stochastic=True)
-    jax_mcmc = build_gibbs_pmmh_sampler(pf_ll_fn, prior=NormalPrior.isotropic(2))
+    jax_mcmc = build_gibbs_pmmh_sampler(pf_ll_fn, prior=prior_spec)
     return v_ll_fn, jax_mcmc
 
 
 class SIR(DynamicalSimulator):
     r"""SIR (Susceptible-Infected-Recovered) Epidemic Simulator (SDE and ODE modes).
 
-    Presets:
-    --------
-    - ``"markovsbi"`` (default): SDE mode with scaled-sigmoid rates in ``(0, 2)`` and ``N(0, I_2)`` prior.
-    - ``"sbibm"``: ODE mode matching Lueckmann et al. (2021) with LogNormal prior and Binomial observations.
+    Presets may be passed as a registered name (``"markovsbi"``, ``"sbibm"``) or
+    directly as an :class:`SIRPreset` data object.
     """
 
     def __init__(
@@ -314,9 +338,9 @@ class SIR(DynamicalSimulator):
         obs_sigma: float | None = None,
         summary: str | None | _UnsetType = _UNSET,
         mode: str | None = None,
-        preset: str = "markovsbi",
+        preset: str | SIRPreset = "markovsbi",
         u0: torch.Tensor | None = None,
-        prior: pdist.Distribution | None = None,
+        prior: PriorSpec | pdist.Distribution | None = None,
         param_transform: str | None = None,
         param_order: str | None = None,
         total_population: float | None = None,
@@ -328,13 +352,18 @@ class SIR(DynamicalSimulator):
                 f"SIR requires dim_parameters=2 (gamma, beta), got {dim_parameters}."
             )
 
-        preset_key = preset.lower()
-        if preset_key not in _SIR_PRESETS:
-            raise ValueError(
-                f"Unknown preset '{preset}'. Supported presets are 'markovsbi' and 'sbibm'."
-            )
-        cfg = _SIR_PRESETS[preset_key]
-        self.preset = preset_key
+        if isinstance(preset, SIRPreset):
+            cfg = preset
+            self.preset = "custom"
+        else:
+            preset_key = preset.lower()
+            if preset_key not in SIR_PRESETS:
+                raise ValueError(
+                    f"Unknown preset '{preset}'. Supported presets: {', '.join(SIR_PRESETS)}."
+                )
+            cfg = SIR_PRESETS[preset_key]
+            self.preset = preset_key
+        self.preset_config = cfg
 
         self.dt = float(cfg.dt if dt is None else dt)
         self.inner_steps = int(cfg.inner_steps if inner_steps is None else inner_steps)
@@ -393,22 +422,29 @@ class SIR(DynamicalSimulator):
             **kwargs,
         )
 
+        prior_spec = cfg.prior if prior is None else as_prior_spec(prior)
+        if prior_spec.dim != dim_parameters:
+            raise ValueError(
+                f"Expected prior of dimension {dim_parameters}, got {prior_spec.dim}."
+            )
+        self.prior_spec = prior_spec
+        self.prior_dist = prior_spec.to_pyro()
+        self._prior_x0_dist = cfg.prior_x0.to_pyro()
+        self.default_step_size = float(cfg.default_step_size)
+        self._default_x_obs = cfg.default_x_obs
+
         if prior is not None:
-            self.prior_dist = prior
-            self.canonical_theta = torch.zeros(2, dtype=torch.float32)
-        elif self.preset == "sbibm":
-            assert cfg.prior_loc is not None and cfg.prior_scale is not None
-            self.prior_dist = pdist.LogNormal(
-                loc=torch.tensor(cfg.prior_loc, dtype=torch.float32),
-                scale=torch.tensor(cfg.prior_scale, dtype=torch.float32),
-            ).to_event(1)
-            self.canonical_theta = torch.tensor([0.4, 1.0 / 8.0], dtype=torch.float32)
+            self.canonical_theta = torch.tensor(
+                prior_spec.canonical_point(), dtype=torch.float32
+            )
+        elif self.param_order != cfg.param_order:
+            self.canonical_theta = torch.tensor(
+                (cfg.canonical_theta[1], cfg.canonical_theta[0]), dtype=torch.float32
+            )
         else:
-            self.prior_dist = pdist.Normal(
-                loc=torch.zeros(2, dtype=torch.float32),
-                scale=torch.ones(2, dtype=torch.float32),
-            ).to_event(1)
-            self.canonical_theta = torch.zeros(2, dtype=torch.float32)
+            self.canonical_theta = torch.tensor(
+                cfg.canonical_theta, dtype=torch.float32
+            )
 
         self._u0_tuple = u0_tuple
         _, self._jax_solver_batch, _ = _get_sir_solver_bundle(
@@ -440,18 +476,13 @@ class SIR(DynamicalSimulator):
             self.param_order,
             self._u0_tuple,
             ll_kind,
-            cfg.prior_type,
-            cfg.prior_loc,
-            cfg.prior_scale,
+            self.prior_spec,
             canon_tuple,
         )
 
     def get_prior_x0(self) -> pdist.Distribution:
         """Prior over initial condition ``x0 = [S, I, R]``."""
-        return pdist.Uniform(
-            low=torch.zeros(3, dtype=torch.float32),
-            high=torch.full((3,), 5.0, dtype=torch.float32),
-        ).to_event(1)
+        return self._prior_x0_dist
 
     @staticmethod
     @override
@@ -609,37 +640,19 @@ class SIR(DynamicalSimulator):
         burn_in: int = 200,
         inner_thin: int = 4,
         n_particles: int = 150,
-        step_size: float = 0.1,
+        step_size: float | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Sample from ``p(theta | y_{1:T})`` using JAX MCMC / Gibbs PMMH."""
         if x_obs is None:
-            if self.preset == "sbibm":
-                th_star = self.canonical_theta
-                if self.summary == "binomial":
-                    x_obs = self.simulate(th_star)
-                else:
-                    x_obs = self._solve(
-                        th_star.unsqueeze(0), u0=self.u0.unsqueeze(0)
-                    )[0].T
+            if self._default_x_obs is not None:
+                x_obs = torch.tensor(self._default_x_obs, dtype=torch.float32)
+            elif self.summary == "binomial":
+                x_obs = self.simulate(self.canonical_theta)
             else:
-                # Default observation generated from theta = 0 with seed 42
-                x_obs = torch.tensor(
-                    [
-                        [4.0000000, 1.0000000, 0.0000000],
-                        [3.7881465, 1.1751375, 0.0533900],
-                        [3.5549567, 1.3938990, 0.1153643],
-                        [3.2974174, 1.5862643, 0.1903032],
-                        [3.0364633, 1.7333066, 0.2691698],
-                        [2.7711196, 1.9520751, 0.3586609],
-                        [2.5065825, 2.1024864, 0.4649960],
-                        [2.2470863, 2.2430851, 0.5757274],
-                        [1.9985336, 2.4134316, 0.6894845],
-                        [1.7609777, 2.6007223, 0.8086434],
-                        [1.5459836, 2.6992354, 0.9370170],
-                    ],
-                    dtype=torch.float32,
-                )
+                x_obs = self._solve(
+                    self.canonical_theta.unsqueeze(0), u0=self.u0.unsqueeze(0)
+                )[0].T
 
         if self.mode == "ode":
             x_jax, _ = self._prepare_ode_obs(x_obs)
@@ -648,6 +661,9 @@ class SIR(DynamicalSimulator):
 
         rng_key = self._next_rng_key()
         num_samples_per_chain = math.ceil(num_samples / n_chains)
+        eff_step_size = (
+            self.default_step_size if step_size is None else float(step_size)
+        )
 
         if self.mode == "ode":
             samples_jax = self._jax_mcmc(
@@ -657,7 +673,7 @@ class SIR(DynamicalSimulator):
                 num_samples_per_chain=num_samples_per_chain,
                 burn_in=burn_in,
                 inner_thin=inner_thin,
-                step_size=step_size,
+                step_size=eff_step_size,
             )
         else:
             samples_jax = self._jax_mcmc(
@@ -668,6 +684,6 @@ class SIR(DynamicalSimulator):
                 burn_in=burn_in,
                 inner_thin=inner_thin,
                 n_particles=n_particles,
-                step_size=step_size,
+                step_size=eff_step_size,
             )
         return self._finalize_mcmc_samples(samples_jax, num_samples)

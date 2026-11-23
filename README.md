@@ -60,6 +60,33 @@ x = sim.simulate(thetas)
 print("Simulated shapes:", x.shape)
 ```
 
+## Custom Presets & Priors
+
+Presets are declarative data objects (e.g., `LVPreset`, `SIRPreset`, `GaussianGaussianPreset`, `UniformGaussianPreset`) backed by hashable `PriorSpec` objects (`NormalPrior`, `UniformPrior`, `LogNormalPrior`). You can pass a custom preset directly—or pass any Pyro `Normal`/`Uniform`/`LogNormal` distribution as `prior=`—without modifying simulator code:
+
+```python
+from sbi_simulator import LV_PRESETS, LotkaVolterra, UniformPrior
+
+custom_preset = LVPreset(
+    dt=0.01,
+    inner_steps=10,
+    sigma1=0.0,
+    sigma2=0.0,
+    num_steps=21,
+    obs_sigma=0.05,
+    mode="ode",
+    u0=(30.0, 1.0),
+    summary=None,
+    param_transform="identity",
+    param_order="alphabetical",
+    prior=UniformPrior.box(4, 0.1, 2.0),
+    prior_x0=UniformPrior.box(2, 0.0, 100.0),
+    canonical_theta=(0.8, 0.2, 0.8, 0.2),
+    default_step_size=0.05,
+)
+sim = LotkaVolterra(preset=custom_preset)
+```
+
 ## Adding a New Simulator
 
 1. Create a subpackage under `src/sbi_simulator/<YourSim>/` with `__init__.py` and `simulator.py`.

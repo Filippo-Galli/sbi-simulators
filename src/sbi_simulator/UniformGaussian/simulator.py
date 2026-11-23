@@ -10,6 +10,7 @@ Reference:
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import override
 
 import numpy as np
@@ -21,14 +22,25 @@ from ..base import Simulator
 from ..sampling import rejection_sample_box
 
 
+@dataclass(frozen=True)
+class UniformGaussianPreset:
+    """Declarative configuration for a Uniform-Gaussian benchmark variant."""
+
+    sigma: float
+    L: float | None = None
+
+
+UNIFORM_GAUSSIAN_PRESETS: dict[str, UniformGaussianPreset] = {
+    "default": UniformGaussianPreset(sigma=1.0, L=None),
+    "sbibm": UniformGaussianPreset(sigma=math.sqrt(0.1), L=1.0),
+}
+
+
 class UniformGaussian(Simulator):
     """Uniform-Gaussian simulator as introduced in Samaroo et al. (2026).
 
-    Model specification:
-        - Parameter prior: ``theta ~ Uniform([-L_d, L_d]^d)``
-        - Data likelihood: ``x | theta ~ N(theta, sigma^2 * I_d)``
-        - Observed data: ``x_obs = 0`` (by default)
-        - Ground truth posterior: ``theta | x_obs ~ N_{[-L_d, L_d]^d}(x_mean, (sigma^2 / N) * I_d)``
+    Presets may be passed as a registered name (``"default"``, ``"sbibm"``) or
+    directly as a :class:`UniformGaussianPreset` data object.
     """
 
     def __init__(
@@ -39,19 +51,23 @@ class UniformGaussian(Simulator):
         dim_data: int | None = None,
         alpha: float = 0.99,
         L: float | None = None,
-        preset: str = "default",
+        preset: str | UniformGaussianPreset = "default",
         **kwargs,
     ):
-        preset_key = preset.lower()
-        if preset_key not in ("default", "sbibm"):
-            raise ValueError(
-                f"Unknown preset '{preset}'. Supported presets are 'default' and 'sbibm'."
-            )
-        self.preset = preset_key
-        if sigma is None:
-            self.sigma = math.sqrt(0.1) if self.preset == "sbibm" else 1.0
+        if isinstance(preset, UniformGaussianPreset):
+            cfg = preset
+            self.preset = "custom"
         else:
-            self.sigma = float(sigma)
+            preset_key = preset.lower()
+            if preset_key not in UNIFORM_GAUSSIAN_PRESETS:
+                raise ValueError(
+                    f"Unknown preset '{preset}'. Supported presets: {', '.join(UNIFORM_GAUSSIAN_PRESETS)}."
+                )
+            cfg = UNIFORM_GAUSSIAN_PRESETS[preset_key]
+            self.preset = preset_key
+        self.preset_config = cfg
+
+        self.sigma = float(cfg.sigma if sigma is None else sigma)
         self.alpha = float(alpha)
 
         if dim_data is None:
@@ -61,10 +77,9 @@ class UniformGaussian(Simulator):
             seed=seed, dim_parameters=dim_parameters, dim_data=dim_data, **kwargs
         )
 
-        if L is not None:
-            self.L = float(L)
-        elif self.preset == "sbibm":
-            self.L = 1.0
+        resolved_L = cfg.L if L is None else L
+        if resolved_L is not None:
+            self.L = float(resolved_L)
         else:
             self.L = float(self.compute_prior_bound(self.dim_parameters, self.alpha))
 
