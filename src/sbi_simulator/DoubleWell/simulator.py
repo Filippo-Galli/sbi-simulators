@@ -17,6 +17,7 @@ from ..mcmc import (
     build_jax_trajectory_solver,
     build_particle_filter_ll,
 )
+from ..priors import NormalPrior
 from ..summary_stats import trajectory_stats_interleaved
 
 
@@ -70,7 +71,7 @@ def _get_double_well_jax_bundle(
     )
     pf_ll_fn = build_particle_filter_ll(step_fn, obs_dim=dim, obs_sigma=obs_sigma)
     v_pf_ll_fn = build_batched_ll(pf_ll_fn, stochastic=True)
-    jax_mcmc = build_gibbs_pmmh_sampler(pf_ll_fn, dim_parameters=2)
+    jax_mcmc = build_gibbs_pmmh_sampler(pf_ll_fn, NormalPrior.isotropic(2))
     return solve_batch, v_pf_ll_fn, jax_mcmc
 
 
@@ -143,10 +144,8 @@ class DoubleWell(DynamicalSimulator):
             **kwargs,
         )
 
-        self.prior_dist = pdist.Normal(
-            loc=torch.zeros(dim_parameters, dtype=torch.float32),
-            scale=torch.ones(dim_parameters, dtype=torch.float32),
-        ).to_event(1)
+        self.prior_spec = NormalPrior.isotropic(dim_parameters)
+        self.prior_dist = self.prior_spec.to_pyro()
 
         self._jax_solver_batch, self._v_pf_ll_fn, self._jax_mcmc = (
             _get_double_well_jax_bundle(

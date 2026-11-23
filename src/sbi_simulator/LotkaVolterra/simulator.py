@@ -20,6 +20,7 @@ from ..mcmc import (
     build_ode_ll,
     build_particle_filter_ll,
 )
+from ..priors import LogNormalPrior, NormalPrior, PriorSpec, UniformPrior
 from ..summary_stats import trajectory_stats_2d_lv
 
 
@@ -346,14 +347,16 @@ def _get_lv_mcmc_bundle(
             obs_sigma,
             ll_kind,
         )
+        prior_spec: PriorSpec
+        if prior_type == "lognormal" and prior_loc is not None and prior_scale is not None:
+            prior_spec = LogNormalPrior(loc=prior_loc, scale=prior_scale)
+        elif prior_type == "uniform":
+            prior_spec = UniformPrior.box(4, prior_low, prior_high)
+        else:
+            prior_spec = NormalPrior.isotropic(4)
         jax_mcmc = build_mh_mcmc_sampler(
             ll_fn,
-            dim_parameters=4,
-            prior_type=prior_type,
-            prior_low=prior_low,
-            prior_high=prior_high,
-            prior_loc=prior_loc,
-            prior_scale=prior_scale,
+            prior=prior_spec,
             default_init_theta=default_init_theta,
         )
         return v_ll_fn, jax_mcmc
@@ -371,7 +374,7 @@ def _get_lv_mcmc_bundle(
     )
     pf_ll_fn = build_particle_filter_ll(step_fn, obs_dim=2, obs_sigma=obs_sigma)
     v_ll_fn = build_batched_ll(pf_ll_fn, stochastic=True)
-    jax_mcmc = build_gibbs_pmmh_sampler(pf_ll_fn, dim_parameters=4)
+    jax_mcmc = build_gibbs_pmmh_sampler(pf_ll_fn, prior=NormalPrior.isotropic(4))
     return v_ll_fn, jax_mcmc
 
 

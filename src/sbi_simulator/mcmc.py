@@ -5,6 +5,8 @@ import functools
 import jax
 import jax.numpy as jnp
 
+from .priors import PriorSpec
+
 
 def systematic_resample(weights: jax.Array, key: jax.Array) -> jax.Array:
     """Systematic resampling of particles in JAX.
@@ -152,20 +154,20 @@ def build_particle_filter_ll(
 
 def build_gibbs_pmmh_sampler(
     pf_ll_fn,
-    dim_parameters: int,
+    prior: PriorSpec,
 ):
     """Build a JIT-compiled Gibbs Particle Marginal Metropolis-Hastings (PMMH) sampler in JAX.
 
     Features:
-    - Per-chain independent SIR (Sequential Importance Resampling) mode discovery from prior
+    - Per-chain independent SIR (Sequential Importance Resampling) mode discovery from ``prior``
     - Gibbs updates alternating between ``inner_thin`` parameter steps (frozen particle key)
       and an independent MH step on the particle filter key
-    - Standard Normal prior ``N(0, I_D)`` on theta
     """
-    log_prior_norm = (dim_parameters / 2.0) * jnp.log(2.0 * jnp.pi)
+    dim_parameters = prior.dim
 
-    def log_joint(theta, x_obs, key, n_particles: int = 150):
-        lp_prior = -0.5 * jnp.sum(theta**2) - log_prior_norm
+    def log_joint(state_val, x_obs, key, n_particles: int = 150):
+        lp_prior = prior.jax_log_prob_unconstrained(state_val)
+        theta = prior.from_unconstrained(state_val)
         ll = pf_ll_fn(theta, x_obs, key, n_particles=n_particles)
         total = lp_prior + ll
         return jnp.where(jnp.isfinite(total), total, -jnp.inf)
@@ -198,7 +200,7 @@ def build_gibbs_pmmh_sampler(
 
         def init_single_chain(k):
             k1, k2, k3 = jax.random.split(k, 3)
-            thetas_sir = jax.random.normal(k1, shape=(n_sir, dim_parameters))
+            thetas_sir = prior.jax_sample_unconstrained(k1, n_sir)
             keys_sir = jax.random.split(k2, n_sir)
             lps = jax.vmap(lambda th, k_pf: log_joint(th, x_obs, k_pf, n_particles))(
                 thetas_sir, keys_sir
@@ -245,7 +247,7 @@ def build_gibbs_pmmh_sampler(
         _, all_samples = jax.lax.scan(
             scan_step, (curr_thetas, curr_pf_keys, curr_lp), keys
         )
-        post_burnin = all_samples[burn_in:]
+        post_burnin = prior.from_unconstrained(all_samples[burn_in:])
         return post_burnin.transpose(1, 0, 2).reshape(-1, dim_parameters)
 
     return run_mcmc
@@ -285,12 +287,7 @@ def build_ode_ll(
 
 def build_mh_mcmc_sampler(
     ll_fn,
-    dim_parameters: int,
-    prior_type: str = "gaussian",
-    prior_low: float = -5.0,
-    prior_high: float = 2.0,
-    prior_loc: tuple[float, ...] | None = None,
-    prior_scale: tuple[float, ...] | None = None,
+    prior: PriorSpec,
     default_init_theta: tuple[float, ...] | None = None,
     init_strategy: str | None = None,
 ):
@@ -300,23 +297,15 @@ def build_mh_mcmc_sampler(
     ----------
     ll_fn : callable
         Deterministic scalar log-likelihood ``(theta, x_obs) -> float``.
-    dim_parameters : int
-        Dimensionality of ``theta``.
-    prior_type : {"gaussian", "uniform", "lognormal"}, default "gaussian"
-        Prior family over ``theta``.
-    prior_low, prior_high : float
-        Box bounds when ``prior_type == "uniform"``.
-    prior_loc, prior_scale : tuple[float, ...], optional
-        Mean and std of ``log(theta)`` when ``prior_type == "lognormal"``.
+    prior : PriorSpec
+        Hashable prior specification governing parameter support, log-prior, and transforms.
     default_init_theta : tuple[float, ...], optional
         Seed parameter vector used when ``init_strategy == "jitter"``.
     init_strategy : {"jitter", "sir_argmax", "sir_resample", "prior"}, optional
         Chain initialization strategy. Defaults to ``"jitter"`` when
         ``default_init_theta`` is provided, otherwise ``"sir_argmax"``.
     """
-    if prior_type not in ("gaussian", "uniform", "lognormal"):
-        raise ValueError(f"Unsupported prior_type: {prior_type}")
-
+    dim_parameters = prior.dim
     if init_strategy is None:
         init_strategy = "jitter" if default_init_theta is not None else "sir_argmax"
     if init_strategy not in ("jitter", "sir_argmax", "sir_resample", "prior"):
@@ -324,18 +313,6 @@ def build_mh_mcmc_sampler(
     if init_strategy == "jitter" and default_init_theta is None:
         raise ValueError("init_strategy='jitter' requires default_init_theta.")
 
-    log_prior_norm = (dim_parameters / 2.0) * jnp.log(2.0 * jnp.pi)
-    loc_arr = (
-        jnp.zeros(dim_parameters, dtype=jnp.float32)
-        if prior_loc is None
-        else jnp.asarray(prior_loc, dtype=jnp.float32)
-    )
-    scale_arr = (
-        jnp.ones(dim_parameters, dtype=jnp.float32)
-        if prior_scale is None
-        else jnp.asarray(prior_scale, dtype=jnp.float32)
-    )
-    log_ln_norm = jnp.sum(jnp.log(scale_arr)) + log_prior_norm
     init_arr = (
         None
         if default_init_theta is None
@@ -343,39 +320,13 @@ def build_mh_mcmc_sampler(
     )
 
     def log_joint(state_val, x_obs):
-        if prior_type == "uniform":
-            in_prior = jnp.all((state_val >= prior_low) & (state_val <= prior_high))
-            ll = ll_fn(state_val, x_obs)
-            return jnp.where(in_prior & jnp.isfinite(ll), ll, -jnp.inf)
-
-        if prior_type == "lognormal":
-            # state_val is z = log(theta) ~ Normal(loc_arr, scale_arr)
-            lp_prior = (
-                -0.5 * jnp.sum(((state_val - loc_arr) / scale_arr) ** 2) - log_ln_norm
-            )
-            ll = ll_fn(jnp.exp(state_val), x_obs)
-        else:
-            lp_prior = -0.5 * jnp.sum(state_val**2) - log_prior_norm
-            ll = ll_fn(state_val, x_obs)
-
+        lp_prior = prior.jax_log_prob_unconstrained(state_val)
+        theta = prior.from_unconstrained(state_val)
+        ll = ll_fn(theta, x_obs)
         total = lp_prior + ll
         return jnp.where(jnp.isfinite(total), total, -jnp.inf)
 
     v_log_joint = jax.vmap(log_joint, in_axes=(0, None))
-
-    def sample_prior_batch(key, count: int):
-        if prior_type == "uniform":
-            return jax.random.uniform(
-                key,
-                shape=(count, dim_parameters),
-                minval=prior_low,
-                maxval=prior_high,
-            )
-        if prior_type == "lognormal":
-            return (
-                loc_arr + jax.random.normal(key, shape=(count, dim_parameters)) * scale_arr
-            )
-        return jax.random.normal(key, shape=(count, dim_parameters))
 
     @functools.partial(
         jax.jit,
@@ -400,7 +351,7 @@ def build_mh_mcmc_sampler(
         k_init, k_mcmc = jax.random.split(rng_key)
 
         if init_strategy == "prior":
-            curr_thetas = sample_prior_batch(k_init, n_chains)
+            curr_thetas = prior.jax_sample_unconstrained(k_init, n_chains)
             curr_lp = v_log_joint(curr_thetas, x_obs)
         else:
 
@@ -409,17 +360,14 @@ def build_mh_mcmc_sampler(
                     assert init_arr is not None
                     k1, _ = jax.random.split(k)
                     jitter = jax.random.normal(k1, shape=(dim_parameters,)) * 0.05
-                    if prior_type == "lognormal":
-                        cand_th = jnp.log(jnp.maximum(init_arr, 1e-12)) + jitter
-                    else:
-                        cand_th = init_arr + jitter
-                        if prior_type == "uniform":
-                            cand_th = jnp.clip(cand_th, prior_low, prior_high)
+                    cand_th = prior.clip_unconstrained(
+                        prior.to_unconstrained(init_arr) + jitter
+                    )
                     return cand_th, log_joint(cand_th, x_obs)
 
                 if init_strategy == "sir_resample":
                     k1, k2 = jax.random.split(k)
-                    cands = sample_prior_batch(k1, n_sir)
+                    cands = prior.jax_sample_unconstrained(k1, n_sir)
                     lps = v_log_joint(cands, x_obs)
                     safe_lps = jnp.where(jnp.isfinite(lps), lps, -jnp.inf)
                     max_lp = jnp.max(safe_lps)
@@ -431,7 +379,7 @@ def build_mh_mcmc_sampler(
                     return cands[idx], lps[idx]
 
                 # sir_argmax
-                cands = sample_prior_batch(k, n_sir)
+                cands = prior.jax_sample_unconstrained(k, n_sir)
                 lps = v_log_joint(cands, x_obs)
                 safe_lps = jnp.where(jnp.isfinite(lps), lps, -jnp.inf)
                 best_idx = jnp.argmax(safe_lps)
@@ -460,9 +408,7 @@ def build_mh_mcmc_sampler(
         total_steps = burn_in + num_samples_per_chain
         keys = jax.random.split(k_mcmc, total_steps)
         _, all_samples = jax.lax.scan(scan_step, (curr_thetas, curr_lp), keys)
-        post_burnin = all_samples[burn_in:]
-        if prior_type == "lognormal":
-            post_burnin = jnp.exp(post_burnin)
+        post_burnin = prior.from_unconstrained(all_samples[burn_in:])
         return post_burnin.transpose(1, 0, 2).reshape(-1, dim_parameters)
 
     return run_mcmc

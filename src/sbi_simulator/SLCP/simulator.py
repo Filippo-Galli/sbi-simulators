@@ -13,6 +13,7 @@ import torch
 from ..base import Simulator
 from ..compositional import sample_two_step
 from ..mcmc import build_batched_ll, build_mh_mcmc_sampler
+from ..priors import UniformPrior
 
 
 @functools.lru_cache(maxsize=4)
@@ -53,10 +54,7 @@ def _get_slcp_jax_bundle():
     v_ll_fn = build_batched_ll(ll_fn, stochastic=False)
     jax_mcmc = build_mh_mcmc_sampler(
         ll_fn,
-        dim_parameters=5,
-        prior_type="uniform",
-        prior_low=-3.0,
-        prior_high=3.0,
+        prior=UniformPrior.box(5, -3.0, 3.0),
         init_strategy="sir_resample",
     )
     return v_ll_fn, jax_mcmc
@@ -112,10 +110,8 @@ class SLCP(Simulator):
 
         self.prior_low = -3.0
         self.prior_high = 3.0
-        self.prior_dist = pdist.Uniform(
-            low=torch.full((5,), self.prior_low, dtype=torch.float32),
-            high=torch.full((5,), self.prior_high, dtype=torch.float32),
-        ).to_event(1)
+        self.prior_spec = UniformPrior.box(5, self.prior_low, self.prior_high)
+        self.prior_dist = self.prior_spec.to_pyro()
 
         self.u0 = torch.zeros(2, dtype=torch.float32)
         self._rng_key: jax.Array = jax.random.PRNGKey(self.seed)

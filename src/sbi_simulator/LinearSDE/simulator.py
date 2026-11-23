@@ -13,6 +13,7 @@ from jax.scipy.linalg import expm
 
 from ..dynamical import DynamicalSimulator
 from ..mcmc import build_batched_ll, build_mh_mcmc_sampler
+from ..priors import NormalPrior
 from ..summary_stats import trajectory_stats_2d_linear
 
 
@@ -183,8 +184,7 @@ def _get_linear_sde_jax_bundle(
     v_kf_ll_fn = build_batched_ll(kf_ll_fn, stochastic=False)
     jax_mcmc = build_mh_mcmc_sampler(
         kf_ll_fn,
-        dim_parameters=dim_parameters,
-        prior_type="gaussian",
+        prior=NormalPrior.isotropic(dim_parameters),
         init_strategy="prior",
     )
     return solve_batch, step_batch_jit, v_kf_ll_fn, jax_mcmc
@@ -279,10 +279,8 @@ class LinearSDE(DynamicalSimulator):
             **kwargs,
         )
 
-        self.prior_dist = pdist.Normal(
-            loc=torch.zeros(self.dim_parameters, dtype=torch.float32),
-            scale=torch.ones(self.dim_parameters, dtype=torch.float32),
-        ).to_event(1)
+        self.prior_spec = NormalPrior.isotropic(self.dim_parameters)
+        self.prior_dist = self.prior_spec.to_pyro()
 
         (
             self._jax_solver_batch,
