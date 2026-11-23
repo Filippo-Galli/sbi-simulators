@@ -16,10 +16,13 @@ class GaussianGaussian(Simulator):
         dim_parameters: int = 10,
         seed: int = 42,
         dim_data: int | None = None,
+        **kwargs,
     ):
         if dim_data is None:
             dim_data = dim_parameters
-        super().__init__(seed=seed, dim_parameters=dim_parameters, dim_data=dim_data)
+        super().__init__(
+            seed=seed, dim_parameters=dim_parameters, dim_data=dim_data, **kwargs
+        )
 
     def _diag_sigma(self, dim: int) -> torch.Tensor:
         # Variances scaling linearly from 0.6 to 1.4 across `dim` entries

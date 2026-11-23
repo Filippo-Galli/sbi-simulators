@@ -70,17 +70,55 @@ def _build_double_well_sde_jax_solver(step_one_fn, num_steps: int = 11, dim: int
 
 
 class DoubleWell(Simulator):
-    r"""Double-Well Stochastic Differential Equation (SDE) simulator.
+    r"""Double-Well Potential Stochastic Differential Equation (SDE) Simulator.
 
-    Formulation:
-        dx = (theta_1 * x + theta_2 * x^3) dt + dW
+    Mathematical Model:
+    -------------------
+    The state is a $D$-dimensional vector $x(t) \in \mathbb{R}^D$ (default $D=4$), representing
+    particles moving in a bistable symmetric potential well with Brownian noise excitation.
 
-    where parameters are mapped from unconstrained space via:
-        theta_1 = exp(0.5 * \tilde{\theta}_0)
-        theta_2 = -exp(0.5 * \tilde{\theta}_1)
+    1. Prior Distribution:
+       The parameters are represented in an unconstrained latent space $\tilde{\theta} \in \mathbb{R}^2$:
+           $$\tilde{\theta} = [\tilde{\theta}_0, \tilde{\theta}_1]^T \sim \mathcal{N}(0, I_2)$$
 
-    Parameters:
-        theta: 2D vector in R^2 with standard normal prior N(0, I_2).
+    2. Parameter Transformation:
+       The latent parameters map to positive potential parameters via an exponential transformation:
+           $$\theta_1 = \exp(0.5 \cdot \tilde{\theta}_0) > 0 \quad \text{(linear anti-damping)}$$
+           $$\theta_2 = -\exp(0.5 \cdot \tilde{\theta}_1) < 0 \quad \text{(cubic restoring force)}$$
+       These parameters define the bistable potential $V(x) = -\frac{\theta_1}{2} x^2 - \frac{\theta_2}{4} x^4$,
+       which possesses two stable potential wells at $x^* = \pm \sqrt{-\theta_1 / \theta_2}$.
+
+    3. Continuous Dynamics:
+       Stochastic differential equation governing each state coordinate:
+           $$dx_t = (\theta_1 x_t + \theta_2 x_t^3) \, dt + dW_t$$
+       where $W_t$ is standard $D$-dimensional Brownian motion.
+
+    4. Initial Condition:
+       Default alternating initial state $u_0 = [-0.5, 0.5, \dots, -0.5, 0.5]^T \in \mathbb{R}^D$.
+
+    5. Numerical Integration & Observation Model:
+       Integrated using Euler-Maruyama discretization with step size $dt = 0.005$
+       and `inner_steps` = 10 sub-steps per observation interval:
+           $$\Delta t_{\text{obs}} = dt \times \text{inner\_steps} = 0.05$$
+       Over $T = \text{num\_steps} = 11$, total simulated duration is $t \in [0, 0.50]$.
+       Additive Gaussian observation noise with standard deviation $\sigma_{\text{obs}} = 0.05$:
+           $$y_t \sim \mathcal{N}(x_t, \sigma_{\text{obs}}^2 I_D), \quad t = 0, \dots, T-1$$
+
+    6. Summary Modes:
+       - `None`: Raw trajectory of shape $(D \times \text{num\_steps},) = (44,)$.
+       - `"subsample"`: Trajectory with additive Gaussian observation noise $\sigma_{\text{obs}}$, shape $(44,)$.
+       - `"stats"`: 16 summary statistics (4 stats for each of the $D=4$ coordinates).
+       - `"two_step"`: Transition pairs $(x_t, x_{t+1})$ of shape $(2D,) = (8,)$ for Markov SBI.
+
+    Posterior Distribution & Reference Sampling:
+    ---------------------------------------------
+    The posterior distribution is conditioned on the full trajectory observations $y_{1:T}$:
+        $$p(\tilde{\theta} \mid y_{1:T}) \propto p(\tilde{\theta}) \, p(y_{1:T} \mid \tilde{\theta})$$
+
+    - The marginal likelihood $p(y_{1:T} \mid \tilde{\theta}) = \int p(y_{1:T}, x_{1:T} \mid \tilde{\theta}) \, dx_{1:T}$
+      is estimated unbiasedly via a bootstrap Sequential Monte Carlo (SMC) Particle Filter ($N=150$ particles).
+    - Sampled via JAX-accelerated Gibbs Particle Marginal Metropolis-Hastings (PMMH).
+    - Returned posterior samples are in the unconstrained latent parameter space $\tilde{\theta} \in \mathbb{R}^2$.
     """
 
     def __init__(
@@ -93,6 +131,7 @@ class DoubleWell(Simulator):
         num_steps: int = 11,
         obs_sigma: float = 0.05,
         summary: str | None = None,
+        **kwargs,
     ):
         self.dim_parameters = dim_parameters
         if dim_parameters != 2:
@@ -118,7 +157,7 @@ class DoubleWell(Simulator):
             raise NotImplementedError(f"Unknown summary mode: {summary}")
         self.summary = summary
 
-        super().__init__(seed, self.dim_parameters, self.dim_data)
+        super().__init__(seed, self.dim_parameters, self.dim_data, **kwargs)
 
         self.u0 = torch.tensor([-0.5, 0.5] * (D // 2), dtype=torch.float32)
 
@@ -373,13 +412,41 @@ class DoubleWell(Simulator):
     def log_likelihood(
         self, parameters: torch.Tensor, x_obs: torch.Tensor, n_particles: int = 150
     ) -> torch.Tensor:
-        """Evaluate marginal log-likelihood using JAX Particle Filter."""
+        r"""Evaluate marginal log-likelihood $\log p(y_{1:T} \mid \tilde{\theta})$.
+
+        Mathematical Formulation:
+        -------------------------
+        Marginal log-likelihood integrating out the latent Brownian diffusion path:
+            $$\log p(y_{1:T} \mid \tilde{\theta}) = \log \int p(y_{1:T}, x_{1:T} \mid \tilde{\theta}) \, dx_{1:T}$$
+        where $y_t \sim \mathcal{N}(x_t, \sigma_{\text{obs}}^2 I_D)$ with $\sigma_{\text{obs}} = 0.05$.
+        Estimated unbiasedly using a JAX-accelerated Sequential Monte Carlo (SMC) bootstrap
+        particle filter with $N = \text{n\_particles}$ particles and systematic resampling.
+
+        Parameters
+        ----------
+        parameters : torch.Tensor
+            Latent parameter tensor $\tilde{\theta} \in \mathbb{R}^2$, shape `(2,)` or `(batch_size, 2)`.
+        x_obs : torch.Tensor
+            Observed trajectory $y_{1:T}$, shape `(D * num_steps,)`, `(D, num_steps)`,
+            or `(num_steps, D)`.
+        n_particles : int, optional
+            Number of particles for the SMC particle filter (default: 150).
+
+        Returns
+        -------
+        torch.Tensor
+            Log-likelihood values of shape `(batch_size,)`.
+        """
         parameters = torch.as_tensor(parameters, dtype=torch.float32)
         if parameters.ndim == 1:
             parameters = parameters.unsqueeze(0)
 
         num_samples = parameters.shape[0]
+        if isinstance(x_obs, np.ndarray):
+            x_obs = torch.from_numpy(x_obs).float()
         x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
+        if x_obs_tensor.ndim == 2 and x_obs_tensor.shape[0] == 1:
+            x_obs_tensor = x_obs_tensor.squeeze(0)
         if x_obs_tensor.ndim == 1:
             x_obs_2d = x_obs_tensor.reshape(self.D, -1).T
         elif x_obs_tensor.ndim == 2 and x_obs_tensor.shape == (self.D, self.num_steps):
@@ -410,7 +477,50 @@ class DoubleWell(Simulator):
         step_size: float = 0.2,
         **kwargs,
     ) -> torch.Tensor:
-        """Sample from posterior p(theta | x_obs) using JAX Gibbs PMMH."""
+        r"""Sample from the true posterior $p(\tilde{\theta} \mid y_{1:T})$ using JAX Gibbs PMMH.
+
+        Mathematical Formulation:
+        -------------------------
+        The target posterior distribution is given by Bayes' rule:
+            $$p(\tilde{\theta} \mid y_{1:T}) \propto p(\tilde{\theta}) \, p(y_{1:T} \mid \tilde{\theta})$$
+        where:
+        - Prior: $\tilde{\theta} \sim \mathcal{N}(0, I_2)$ on latent parameter space.
+        - Parameters: Transformed via $\theta_1 = \exp(0.5 \tilde{\theta}_0) > 0$ and $\theta_2 = -\exp(0.5 \tilde{\theta}_1) < 0$.
+        - Conditioning Observation: The likelihood conditions on the raw state trajectory
+          observations $y_{1:T}$ (or subsampled observations), NOT on summary statistics.
+
+        Inference Algorithm:
+        --------------------
+        Gibbs Particle Marginal Metropolis-Hastings (PMMH) sampler:
+        1. Alternates between parameter random-walk updates (with frozen particle key)
+           and resampling of the particle filter random seeds.
+        2. The particle filter provides an unbiased marginal likelihood estimate $\hat{p}(y_{1:T} \mid \tilde{\theta})$,
+           guaranteeing convergence to the exact stationary posterior distribution $p(\tilde{\theta} \mid y_{1:T})$
+           (Andrieu et al., 2010).
+
+        Parameters
+        ----------
+        x_obs : torch.Tensor or np.ndarray, optional
+            Observed trajectory $y_{1:T}$. If None, defaults to the canonical reference
+            trajectory generated at $\tilde{\theta} = [0, 0]$ with seed 42.
+        num_samples : int, optional
+            Total number of posterior parameter samples to return (default: 1000).
+        n_chains : int, optional
+            Number of parallel MCMC chains run concurrently in JAX (default: 20).
+        burn_in : int, optional
+            Number of initial warmup steps discarded per chain (default: 200).
+        inner_thin : int, optional
+            Sub-sampling thinning factor between saved MCMC states (default: 4).
+        n_particles : int, optional
+            Number of particles used in the SMC particle filter (default: 150).
+        step_size : float, optional
+            Random-walk proposal standard deviation per parameter dimension (default: 0.2).
+
+        Returns
+        -------
+        torch.Tensor
+            Posterior samples of latent parameters $\tilde{\theta} \in \mathbb{R}^2$ with shape `(num_samples, 2)`.
+        """
         if (
             x_obs is None
             and "num_samples" in kwargs
@@ -440,6 +550,8 @@ class DoubleWell(Simulator):
         if isinstance(x_obs, np.ndarray):
             x_obs = torch.from_numpy(x_obs).float()
         x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
+        if x_obs_tensor.ndim == 2 and x_obs_tensor.shape[0] == 1:
+            x_obs_tensor = x_obs_tensor.squeeze(0)
         if x_obs_tensor.ndim == 1:
             x_obs_2d = x_obs_tensor.reshape(self.D, -1).T
         elif x_obs_tensor.ndim == 2 and x_obs_tensor.shape == (self.D, self.num_steps):

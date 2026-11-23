@@ -13,12 +13,15 @@ class BimodalGaussians(Simulator):
         seed: int = 42,
         sigma: float = 0.1,
         dim_data: int | None = None,
+        **kwargs,
     ):
         self.sigma = float(sigma)
         self.shift = 10.0 * self.sigma
         if dim_data is None:
             dim_data = dim_parameters
-        super().__init__(seed=seed, dim_parameters=dim_parameters, dim_data=dim_data)
+        super().__init__(
+            seed=seed, dim_parameters=dim_parameters, dim_data=dim_data, **kwargs
+        )
 
     def get_prior(self) -> pdist.Distribution:
         return pdist.Uniform(

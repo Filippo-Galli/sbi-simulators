@@ -44,6 +44,7 @@ class UniformGaussian(Simulator):
         dim_data: int | None = None,
         alpha: float = 0.99,
         L: float | None = None,
+        **kwargs,
     ):
         self.sigma = float(sigma)
         self.alpha = float(alpha)
@@ -51,7 +52,9 @@ class UniformGaussian(Simulator):
         if dim_data is None:
             dim_data = dim_parameters
 
-        super().__init__(seed=seed, dim_parameters=dim_parameters, dim_data=dim_data)
+        super().__init__(
+            seed=seed, dim_parameters=dim_parameters, dim_data=dim_data, **kwargs
+        )
         torch.manual_seed(seed)
         np.random.seed(seed)
 

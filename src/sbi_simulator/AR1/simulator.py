@@ -35,12 +35,15 @@ class AR1(Simulator):
         seed: int = 42,
         dim_data: int = 100,
         sigma: float = 1.0,
+        **kwargs,
     ):
         self.timeseries_length = dim_data
         self.sigma = float(sigma)
         self.prior_std = 0.2
         self.x0_std = 0.4
-        super().__init__(seed=seed, dim_parameters=dim_parameters, dim_data=dim_data)
+        super().__init__(
+            seed=seed, dim_parameters=dim_parameters, dim_data=dim_data, **kwargs
+        )
 
     @override
     def get_prior(self) -> pdist.Distribution:

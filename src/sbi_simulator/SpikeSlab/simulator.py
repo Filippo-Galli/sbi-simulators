@@ -15,10 +15,13 @@ class SpikeSlab(Simulator):
         seed: int = 42,
         dim_parameters: int = 2,
         dim_data: int | None = None,
+        **kwargs,
     ):
         if dim_data is None:
             dim_data = dim_parameters
-        super().__init__(seed=seed, dim_parameters=dim_parameters, dim_data=dim_data)
+        super().__init__(
+            seed=seed, dim_parameters=dim_parameters, dim_data=dim_data, **kwargs
+        )
 
     @override
     def get_prior(self) -> pdist.Distribution:

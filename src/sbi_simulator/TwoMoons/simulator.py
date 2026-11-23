@@ -11,7 +11,13 @@ from ..Simulator import Simulator
 
 
 class TwoMoons(Simulator):
-    def __init__(self, dim_parameters: int = 2, seed: int = 42, dim_data: int = 2):
+    def __init__(
+        self,
+        dim_parameters: int = 2,
+        seed: int = 42,
+        dim_data: int = 2,
+        **kwargs,
+    ):
         """Initialize the TwoMoons model."""
         self.a_low = -math.pi / 2.0
         self.a_high = +math.pi / 2.0
@@ -19,7 +25,7 @@ class TwoMoons(Simulator):
         self.r_loc = 0.1
         self.r_scale = 0.01
 
-        super().__init__(seed, dim_parameters, dim_data)
+        super().__init__(seed, dim_parameters, dim_data, **kwargs)
 
         prior_bound = 1.0
         self.prior_params = {
