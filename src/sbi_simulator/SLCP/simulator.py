@@ -135,6 +135,7 @@ class SLCP(Simulator):
         seed: int = 42,
         num_data: int = 4,
         summary: str | None = None,
+        **kwargs,
     ):
         self.dim_parameters = dim_parameters
         if dim_parameters != 5:
@@ -155,7 +156,7 @@ class SLCP(Simulator):
             raise NotImplementedError(f"Unknown summary mode: {summary}")
         self.summary = summary
 
-        super().__init__(seed, self.dim_parameters, self.dim_data)
+        super().__init__(seed, self.dim_parameters, self.dim_data, **kwargs)
 
         # Prior distribution setup: Uniform(-3, 3)^5
         self.prior_low = -3.0
@@ -355,7 +356,53 @@ class SLCP(Simulator):
         n_sir: int = 5000,
         **kwargs,
     ) -> torch.Tensor:
-        """Sample from the true posterior p(theta | x_obs) using JAX MCMC."""
+        r"""Sample from the true multimodal posterior $p(\theta \mid x_{\text{obs}})$ using JAX MCMC.
+
+        Mathematical Formulation:
+        -------------------------
+        The target posterior distribution is given by Bayes' rule:
+            $$p(\theta \mid x_{\text{obs}}) \propto p(\theta) \prod_{i=1}^4 \mathcal{N}(y_i \mid m(\theta), \Sigma(\theta))$$
+        where:
+        - Prior: $\theta \sim \text{Uniform}([-3, 3]^5)$.
+        - Mean: $m(\theta) = [\theta_0, \theta_1]^T$.
+        - Covariance: $\Sigma(\theta) = \begin{pmatrix} s_1^2 + \epsilon & \rho s_1 s_2 \\ \rho s_1 s_2 & s_2^2 + \epsilon \end{pmatrix}$
+          with $s_1 = \theta_2^2$, $s_2 = \theta_3^2$, and $\rho = \tanh(\theta_4)$.
+        - Symmetry & Multimodality: Because $s_1, s_2$ depend on the squares of $\theta_2, \theta_3$,
+          the likelihood is invariant under sign flips $(\pm \theta_2, \pm \theta_3)$, producing
+          up to 4 symmetric modes in the posterior.
+
+        Inference Algorithm:
+        --------------------
+        1. Mode Discovery via Sequential Importance Resampling (SIR):
+           $N = \text{n\_sir}$ candidates are sampled uniformly from the prior $[-3, 3]^5$
+           and resampled according to importance weights $w \propto p(x_{\text{obs}} \mid \theta)$.
+           This ensures chains independently discover and initialize across all 4 modes.
+        2. Metropolis-Hastings MCMC:
+           Parallel chains run random-walk proposals with step size `step_size`,
+           burn-in `burn_in`, and thinning `thin`.
+
+        Parameters
+        ----------
+        x_obs : torch.Tensor or np.ndarray, optional
+            Observed 8D data (or shape `(4, 2)`). Defaults to benchmark observation 1 from sbibm.
+        num_samples : int, optional
+            Total number of posterior samples to return (default: 1000).
+        n_chains : int, optional
+            Number of parallel MCMC chains run concurrently in JAX (default: 20).
+        burn_in : int, optional
+            Number of warmup steps discarded per chain (default: 500).
+        thin : int, optional
+            Thinning factor between saved MCMC states (default: 4).
+        step_size : float, optional
+            Proposal standard deviation for MCMC random walk (default: 0.08).
+        n_sir : int, optional
+            Number of prior samples used for importance resampling initialization (default: 5000).
+
+        Returns
+        -------
+        torch.Tensor
+            Posterior parameter samples of shape `(num_samples, 5)`.
+        """
         if (
             x_obs is None
             and "num_samples" in kwargs

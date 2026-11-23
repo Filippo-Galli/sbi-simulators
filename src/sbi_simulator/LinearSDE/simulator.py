@@ -135,18 +135,54 @@ def _build_linear_sde_sampler(kalman_ll_fn, dim_parameters: int):
 
 
 class LinearSDE(Simulator):
-    r"""Linear Gaussian Stochastic Differential Equation (SDE) simulator.
+    r"""Linear Gaussian Stochastic Differential Equation (SDE) Simulator.
 
-    Formulation:
-        dx = A(\theta) x dt + B(\theta) dW
+    Mathematical Model:
+    -------------------
+    The state is a $d$-dimensional vector $x(t) \in \mathbb{R}^d$ ($d=2$ by default) evolving
+    under a linear continuous-time stochastic differential equation:
+        $$dx_t = A(\theta) x_t \, dt + B(\theta) \, dW_t$$
+    where $W_t$ is standard $d$-dimensional Brownian motion.
 
-    Variants:
-        - "periodic": 2D state, 2D parameter vector \theta \in R^2.
-          A(\theta) = [[0, -\theta_0^2], [\theta_1^2, 0]], B = diag(\sigma_1, \sigma_2).
-          Represents a stochastic harmonic oscillator with rotation frequency determined by \theta.
-        - "general": 2D state, 8D parameter vector \theta \in R^8 with unconstrained linear drift and diffusion.
+    1. Prior Distribution & Variants:
+       - `"periodic"`: $\theta \in \mathbb{R}^2 \sim \mathcal{N}(0, I_2)$.
+         Parameterizes a stochastic harmonic oscillator with drift matrix:
+             $$A(\theta) = \begin{pmatrix} 0 & -\theta_0^2 \\ \theta_1^2 & 0 \end{pmatrix}, \quad B = \text{diag}(\sigma_1, \sigma_2)$$
+         with fixed diffusion coefficients $\sigma_1 = \sigma_2 = 0.1$.
+       - `"general"`: $\theta \in \mathbb{R}^8 \sim \mathcal{N}(0, I_8)$.
+         Parameterizes arbitrary linear drift $A(\theta) = \text{reshape}(\theta_{0:4}, (2, 2))$
+         and Cholesky diffusion factor $L_B(\theta) = \text{reshape}(\theta_{4:8}, (2, 2))$ with $B = L_B L_B^T + 0.01 I_2$.
 
-    The model supports exact closed-form matrix fraction decomposition and exact Kalman filter log-likelihood.
+    2. Exact Continuous-to-Discrete Discretization:
+       Over observation step $\Delta t_{\text{obs}} = dt \times \text{inner\_steps} = 0.10$,
+       the discrete transition is exact and Gaussian:
+           $$x_{t+1} = F(\theta) x_t + w_t, \quad w_t \sim \mathcal{N}(0, Q(\theta))$$
+       where $F(\theta) = \exp(A(\theta) \Delta t_{\text{obs}})$ and process noise covariance
+       $Q(\theta) = \int_0^{\Delta t_{\text{obs}}} \exp(A s) B B^T \exp(A^T s) \, ds$
+       are computed in closed form using Van Loan's matrix exponential decomposition:
+           $$\exp \begin{pmatrix} A & B B^T \\ 0 & -A^T \end{pmatrix} \Delta t_{\text{obs}} = \begin{pmatrix} F & Q F^{-T} \\ 0 & F^{-T} \end{pmatrix}$$
+
+    3. Initial Condition & Observation Model:
+       Default initial condition $u_0 = [-0.5, 0.5]^T$.
+       Additive Gaussian observation noise with standard deviation $\sigma_{\text{obs}} = 0.01$:
+           $$y_t \sim \mathcal{N}(x_t, \sigma_{\text{obs}}^2 I_d), \quad t = 0, \dots, T-1$$
+
+    4. Summary Modes:
+       - `None`: Raw trajectory of shape $(d \times \text{num\_steps},) = (22,)$.
+       - `"subsample"`: Trajectory with additive Gaussian observation noise $\sigma_{\text{obs}}$, shape $(22,)$.
+       - `"stats"`: 9 summary statistics (mean, log-variance, ac1, ac2, cross-correlation).
+       - `"two_step"`: Transition pairs $(x_t, x_{t+1})$ of shape $(2d,) = (4,)$ for Markov SBI.
+
+    Posterior Distribution & Reference Sampling:
+    ---------------------------------------------
+    The posterior distribution is conditioned on the full trajectory observations $y_{1:T}$:
+        $$p(\theta \mid y_{1:T}) \propto p(\theta) \, p(y_{1:T} \mid \theta)$$
+
+    - Because the system is linear and Gaussian, the marginal likelihood $p(y_{1:T} \mid \theta)$
+      is computed **analytically in closed form** via the exact Kalman Filter:
+          $$\log p(y_{1:T} \mid \theta) = \sum_{t=1}^{T-1} \log \mathcal{N}(y_t \mid \hat{y}_{t \mid t-1}, S_t)$$
+      where $\hat{y}_{t \mid t-1} = F \mu_{t-1}$ and innovation covariance $S_t = F P_{t-1} F^T + Q + \sigma_{\text{obs}}^2 I_d$.
+    - Posterior samples are drawn via JAX-accelerated Metropolis-Hastings MCMC on the exact marginal likelihood.
     """
 
     def __init__(
@@ -162,6 +198,7 @@ class LinearSDE(Simulator):
         sigma2: float = 0.1,
         obs_sigma: float = 0.01,
         summary: str | None = None,
+        **kwargs,
     ):
         self.variant = variant
         self.d = d
@@ -206,7 +243,7 @@ class LinearSDE(Simulator):
             raise NotImplementedError(f"Unknown summary mode: {summary}")
         self.summary = summary
 
-        super().__init__(seed, self.dim_parameters, self.dim_data)
+        super().__init__(seed, self.dim_parameters, self.dim_data, **kwargs)
 
         self.u0 = torch.tensor([-0.5, 0.5] if d == 2 else [0.0] * d, dtype=torch.float32)
 
@@ -488,12 +525,40 @@ class LinearSDE(Simulator):
         return self.prior_dist
 
     def log_likelihood(self, parameters: torch.Tensor, x_obs: torch.Tensor) -> torch.Tensor:
-        """Evaluate exact marginal log-likelihood using JAX Kalman Filter."""
+        r"""Evaluate exact marginal log-likelihood $\log p(y_{1:T} \mid \theta)$ via Kalman Filter.
+
+        Mathematical Formulation:
+        -------------------------
+        Exact marginal log-likelihood integrating out the continuous Gaussian diffusion path:
+            $$\log p(y_{1:T} \mid \theta) = \sum_{t=1}^{T-1} \log \mathcal{N}(y_t \mid \hat{y}_{t \mid t-1}, S_t)$$
+        where:
+        - Prior state prediction: $\hat{x}_{t \mid t-1} = F(\theta) \mu_{t-1}$
+        - Prior covariance prediction: $P_{t \mid t-1} = F(\theta) P_{t-1} F(\theta)^T + Q(\theta)$
+        - Innovation: $r_t = y_t - \hat{x}_{t \mid t-1}$
+        - Innovation covariance: $S_t = P_{t \mid t-1} + \sigma_{\text{obs}}^2 I_d$
+        - Measurement update: $\mu_t = \hat{x}_{t \mid t-1} + P_{t \mid t-1} S_t^{-1} r_t$,
+          $P_t = P_{t \mid t-1} - P_{t \mid t-1} S_t^{-1} P_{t \mid t-1}$.
+
+        Parameters
+        ----------
+        parameters : torch.Tensor
+            Parameter tensor $\theta$, shape `(dim_parameters,)` or `(batch_size, dim_parameters)`.
+        x_obs : torch.Tensor
+            Observed trajectory $y_{1:T}$, shape `(d * num_steps,)`, `(d, num_steps)`,
+            or `(num_steps, d)`.
+
+        Returns
+        -------
+        torch.Tensor
+            Exact log-likelihood values of shape `(batch_size,)`.
+        """
         parameters = torch.as_tensor(parameters, dtype=torch.float32)
         if parameters.ndim == 1:
             parameters = parameters.unsqueeze(0)
 
         x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
+        if x_obs_tensor.ndim == 2 and x_obs_tensor.shape[0] == 1:
+            x_obs_tensor = x_obs_tensor.squeeze(0)
         if x_obs_tensor.ndim == 1:
             x_obs_2d = x_obs_tensor.reshape(self.d, -1).T
         elif x_obs_tensor.ndim == 2 and x_obs_tensor.shape == (self.d, self.num_steps):
@@ -517,7 +582,45 @@ class LinearSDE(Simulator):
         step_size: float = 0.1,
         **kwargs,
     ) -> torch.Tensor:
-        """Sample from posterior p(theta | x_obs) using JAX MCMC with exact Kalman likelihood."""
+        r"""Sample from the exact posterior $p(\theta \mid y_{1:T})$ using JAX MCMC.
+
+        Mathematical Formulation:
+        -------------------------
+        The target posterior distribution is given by Bayes' rule:
+            $$p(\theta \mid y_{1:T}) \propto p(\theta) \, p(y_{1:T} \mid \theta)$$
+        where:
+        - Prior: $\theta \sim \mathcal{N}(0, I)$ on parameter space.
+        - Likelihood: Exact marginal likelihood $p(y_{1:T} \mid \theta)$ computed in closed form
+          via the Kalman Filter scan over the discrete Gaussian state-space model.
+        - Conditioning Observation: The likelihood conditions on the raw state trajectory
+          observations $y_{1:T}$ (or subsampled observations), NOT on summary statistics.
+
+        Inference Algorithm:
+        --------------------
+        Metropolis-Hastings MCMC in JAX using Gaussian random walk proposals:
+            $$\theta^* \sim \mathcal{N}(\theta, \text{step\_size}^2 I)$$
+        Because the Kalman filter evaluates the exact marginalized likelihood, no particle filter
+        approximation is required, providing highly accurate and fast posterior sampling.
+
+        Parameters
+        ----------
+        x_obs : torch.Tensor or np.ndarray, optional
+            Observed trajectory $y_{1:T}$. If None, defaults to the canonical reference
+            trajectory generated at $\theta = [1.0, 1.0]$ with seed 42.
+        num_samples : int, optional
+            Total number of posterior parameter samples to return (default: 1000).
+        n_chains : int, optional
+            Number of parallel MCMC chains run concurrently in JAX (default: 20).
+        burn_in : int, optional
+            Number of initial warmup steps discarded per chain (default: 200).
+        step_size : float, optional
+            Random-walk proposal standard deviation per parameter dimension (default: 0.1).
+
+        Returns
+        -------
+        torch.Tensor
+            Posterior samples of parameters $\theta$ with shape `(num_samples, dim_parameters)`.
+        """
         if (
             x_obs is None
             and "num_samples" in kwargs
@@ -547,6 +650,8 @@ class LinearSDE(Simulator):
         if isinstance(x_obs, np.ndarray):
             x_obs = torch.from_numpy(x_obs).float()
         x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
+        if x_obs_tensor.ndim == 2 and x_obs_tensor.shape[0] == 1:
+            x_obs_tensor = x_obs_tensor.squeeze(0)
         if x_obs_tensor.ndim == 1:
             x_obs_2d = x_obs_tensor.reshape(self.d, -1).T
         elif x_obs_tensor.ndim == 2 and x_obs_tensor.shape == (self.d, self.num_steps):
