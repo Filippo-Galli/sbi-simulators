@@ -1,23 +1,103 @@
-"""Simulator for the Lotka-Volterra SDE model."""
+"""Simulator for the Lotka-Volterra SDE/ODE model."""
 
+import functools
 import math
+from dataclasses import dataclass
 from typing import override
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pyro
 import pyro.distributions as pdist
 import torch
 
-from ..base import Simulator
-from ..compositional import sample_two_step
+from ..dynamical import DynamicalSimulator
 from ..mcmc import (
+    build_batched_ll,
     build_gibbs_pmmh_sampler,
+    build_jax_trajectory_solver,
     build_mh_mcmc_sampler,
     build_ode_ll,
     build_particle_filter_ll,
 )
+from ..summary_stats import trajectory_stats_2d_lv
+
+
+class _UnsetType:
+    pass
+
+
+_UNSET = _UnsetType()
+
+
+@dataclass(frozen=True)
+class _LVPreset:
+    dt: float
+    inner_steps: int
+    sigma1: float
+    sigma2: float
+    num_steps: int
+    obs_sigma: float
+    mode: str
+    u0: tuple[float, float]
+    summary: str | None
+    param_transform: str
+    param_order: str
+    prior_type: str
+    prior_loc: tuple[float, ...] | None = None
+    prior_scale: tuple[float, ...] | None = None
+    prior_low: float | None = None
+    prior_high: float | None = None
+
+
+_LV_PRESETS: dict[str, _LVPreset] = {
+    "markovsbi": _LVPreset(
+        dt=0.02,
+        inner_steps=5,
+        sigma1=0.1,
+        sigma2=0.1,
+        num_steps=11,
+        obs_sigma=0.05,
+        mode="sde",
+        u0=(1.0, 0.5),
+        summary=None,
+        param_transform="sigmoid",
+        param_order="alphabetical",
+        prior_type="gaussian",
+    ),
+    "sbibm": _LVPreset(
+        dt=20.0 / 9.0 / 200.0,
+        inner_steps=200,
+        sigma1=0.0,
+        sigma2=0.0,
+        num_steps=10,
+        obs_sigma=0.1,
+        mode="ode",
+        u0=(30.0, 1.0),
+        summary="lognormal",
+        param_transform="identity",
+        param_order="alphabetical",
+        prior_type="lognormal",
+        prior_loc=(-0.125, -3.0, -0.125, -3.0),
+        prior_scale=(0.5, 0.5, 0.5, 0.5),
+    ),
+    "papamakarios": _LVPreset(
+        dt=0.01,
+        inner_steps=20,
+        sigma1=0.0,
+        sigma2=0.0,
+        num_steps=151,
+        obs_sigma=0.05,
+        mode="ode",
+        u0=(100.0, 50.0),
+        summary="stats",
+        param_transform="exp",
+        param_order="paper",
+        prior_type="uniform",
+        prior_low=-5.0,
+        prior_high=2.0,
+    ),
+}
 
 
 def _build_lv_step_fn(
@@ -46,101 +126,58 @@ def _build_lv_step_fn(
             x = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         else:
             xdt = drift(x, alpha, beta, gamma, delta)
-            dWt = jax.random.normal(key, shape=(2,)) * jnp.sqrt(dt)
-            B = jnp.array([sigma1 * x[0] * x[1], sigma2 * x[1] * x[0]])
-            x = x + xdt * dt + B * dWt
+            d_wt = jax.random.normal(key, shape=(2,)) * jnp.sqrt(dt)
+            diffusion = jnp.array([sigma1 * x[0] * x[1], sigma2 * x[1] * x[0]])
+            x = x + xdt * dt + diffusion * d_wt
         return jnp.clip(x, 0.0)
 
     def extract_rates(theta):
         if param_transform == "identity":
-            if param_order == "paper":
-                delta, gamma, alpha, beta = theta[0], theta[1], theta[2], theta[3]
-            else:
-                alpha, beta, gamma, delta = theta[0], theta[1], theta[2], theta[3]
+            rates = theta
         elif param_transform == "exp":
-            if param_order == "paper":
-                # theta = (delta, gamma, alpha, beta) as in Papamakarios et al. (2019)
-                delta = jnp.exp(theta[0])
-                gamma = jnp.exp(theta[1])
-                alpha = jnp.exp(theta[2])
-                beta = jnp.exp(theta[3])
-            else:
-                # alphabetical: (alpha, beta, gamma, delta)
-                alpha = jnp.exp(theta[0])
-                beta = jnp.exp(theta[1])
-                gamma = jnp.exp(theta[2])
-                delta = jnp.exp(theta[3])
+            rates = jnp.exp(theta)
         else:
-            # shifted sigmoid into (1.0, 3.0)
-            if param_order == "paper":
-                delta = jax.nn.sigmoid(theta[0]) * 2.0 + 1.0
-                gamma = jax.nn.sigmoid(theta[1]) * 2.0 + 1.0
-                alpha = jax.nn.sigmoid(theta[2]) * 2.0 + 1.0
-                beta = jax.nn.sigmoid(theta[3]) * 2.0 + 1.0
-            else:
-                alpha = jax.nn.sigmoid(theta[0]) * 2.0 + 1.0
-                beta = jax.nn.sigmoid(theta[1]) * 2.0 + 1.0
-                gamma = jax.nn.sigmoid(theta[2]) * 2.0 + 1.0
-                delta = jax.nn.sigmoid(theta[3]) * 2.0 + 1.0
-        return alpha, beta, gamma, delta
+            rates = jax.nn.sigmoid(theta) * 2.0 + 1.0
+        if param_order == "paper":
+            # theta = (delta, gamma, alpha, beta) -> (alpha, beta, gamma, delta)
+            return rates[2], rates[3], rates[1], rates[0]
+        return rates[0], rates[1], rates[2], rates[3]
 
     def step_one(x, key, theta):
         alpha, beta, gamma, delta = extract_rates(theta)
+        if mode == "ode":
 
-        keys = jax.random.split(key, inner_steps)
+            def inner_loop(_i, curr_x):
+                return integrate_step(curr_x, key, alpha, beta, gamma, delta)
+        else:
+            keys = jax.random.split(key, inner_steps)
 
-        def inner_loop(i, curr_x):
-            return integrate_step(curr_x, keys[i], alpha, beta, gamma, delta)
+            def inner_loop(i, curr_x):
+                return integrate_step(curr_x, keys[i], alpha, beta, gamma, delta)
 
         return jax.lax.fori_loop(0, inner_steps, inner_loop, x)
 
     return step_one
 
 
-def _build_lv_sde_jax_solver(
-    step_one_fn, num_steps: int = 11, default_x0: jnp.ndarray | None = None
-):
-    """Build a JIT-compiled batched Euler-Maruyama SDE solver in JAX for Lotka-Volterra."""
-    base_x0 = (
-        jnp.array([1.0, 0.5], dtype=jnp.float32)
-        if default_x0 is None
-        else jnp.asarray(default_x0, dtype=jnp.float32)
-    )
-
-    def solve_single(rng_key, theta, x0=None):
-        u0 = base_x0 if x0 is None else jnp.clip(x0, 0.0)
-
-        def one_step(x, key):
-            x_next = step_one_fn(x, key, theta)
-            return x_next, x_next
-
-        keys = jax.random.split(rng_key, num_steps - 1)
-        _, xs = jax.lax.scan(one_step, u0, keys)
-        full_traj = jnp.concatenate([u0[None, :], xs], axis=0)  # (num_steps, 2)
-        return full_traj.T  # (2, num_steps)
-
-    solve_batch_fn = jax.vmap(solve_single, in_axes=(0, 0, 0))
-
-    def solve_batch(rng_keys, thetas, x0s=None):
-        if x0s is None:
-            x0s = jnp.broadcast_to(base_x0, (thetas.shape[0], 2))
-        return solve_batch_fn(rng_keys, thetas, x0s)
-
-    return jax.jit(solve_batch), jax.jit(solve_single)
-
-
 def _build_lv_stats_ll(
     jax_solver_single,
-    default_x0: jnp.ndarray,
-    scales: jnp.ndarray | None = None,
+    default_x0: jax.Array,
+    scales: tuple[float, ...] = (
+        1.25,
+        2.5,
+        0.125,
+        0.125,
+        0.0125,
+        0.0125,
+        0.0125,
+        0.0125,
+        0.025,
+    ),
 ):
-    """Build a JIT-compiled log-likelihood function on 9 summary statistics for Lotka-Volterra ODE."""
+    """Build a JIT-compiled log-likelihood on 9 summary stats for Lotka-Volterra ODE."""
     dummy_key = jax.random.PRNGKey(0)
-    if scales is None:
-        scales = jnp.array(
-            [1.25, 2.5, 0.125, 0.125, 0.0125, 0.0125, 0.0125, 0.0125, 0.025],
-            dtype=jnp.float32,
-        )
+    scale_arr = jnp.asarray(scales, dtype=jnp.float32)
 
     def stats_from_traj(traj):
         x = traj[0]
@@ -152,10 +189,10 @@ def _build_lv_stats_ll(
         dy = y - mean_y
         var_x = jnp.mean(dx**2)
         var_y = jnp.mean(dy**2)
-        log_var_x = jnp.log(jnp.maximum(var_x, eps))
-        log_var_y = jnp.log(jnp.maximum(var_y, eps))
         denom_x = jnp.maximum(var_x, eps)
         denom_y = jnp.maximum(var_y, eps)
+        log_var_x = jnp.log(denom_x)
+        log_var_y = jnp.log(denom_y)
         ac1_x = jnp.mean(dx[1:] * dx[:-1]) / denom_x
         ac1_y = jnp.mean(dy[1:] * dy[:-1]) / denom_y
         ac2_x = jnp.mean(dx[2:] * dx[:-2]) / denom_x
@@ -179,17 +216,16 @@ def _build_lv_stats_ll(
     def stats_ll(theta, s_obs):
         traj = jax_solver_single(dummy_key, theta, default_x0)
         s_pred = stats_from_traj(traj)
-        diff = (s_pred - s_obs) / scales
+        diff = (s_pred - s_obs) / scale_arr
         ll = -0.5 * jnp.sum(diff**2)
-        has_nan = jnp.isnan(ll)
-        return jnp.where(has_nan, -1e9, ll)
+        return jnp.where(jnp.isfinite(ll), ll, -jnp.inf)
 
     return jax.jit(stats_ll)
 
 
 def _build_lv_lognormal_ll(
     jax_solver_single,
-    default_x0: jnp.ndarray,
+    default_x0: jax.Array,
     obs_sigma: float = 0.1,
 ):
     """Build a JIT-compiled LogNormal observation log-likelihood for Lotka-Volterra ODE."""
@@ -197,72 +233,156 @@ def _build_lv_lognormal_ll(
     log_norm = jnp.log(obs_sigma * jnp.sqrt(2.0 * jnp.pi))
 
     def lognormal_ll(theta, x_obs):
-        # x_obs: (num_steps, 2)
         traj = jax_solver_single(dummy_key, theta, default_x0).T  # (num_steps, 2)
         valid = jnp.all(x_obs > 0.0) & jnp.all(traj > 0.0)
         log_y = jnp.log(jnp.maximum(x_obs, 1e-12))
         log_mu = jnp.log(jnp.maximum(traj, 1e-12))
         diff = (log_y - log_mu) / obs_sigma
         ll = jnp.sum(-0.5 * (diff**2) - log_y - log_norm)
-        has_nan = jnp.isnan(ll)
-        return jnp.where(valid & (~has_nan), ll, -1e9)
+        return jnp.where(valid & jnp.isfinite(ll), ll, -jnp.inf)
 
     return jax.jit(lognormal_ll)
 
 
-_SENTINEL = object()
+@functools.lru_cache(maxsize=32)
+def _get_lv_solver_bundle(
+    dt: float,
+    inner_steps: int,
+    sigma1: float,
+    sigma2: float,
+    num_steps: int,
+    mode: str,
+    param_transform: str,
+    param_order: str,
+    default_x0: tuple[float, float],
+):
+    """Build and cache Lotka-Volterra JAX step function and trajectory solvers."""
+    step_fn = _build_lv_step_fn(
+        dt=dt,
+        inner_steps=inner_steps,
+        sigma1=sigma1,
+        sigma2=sigma2,
+        mode=mode,
+        param_transform=param_transform,
+        param_order=param_order,
+    )
+    solve_batch, solve_single = build_jax_trajectory_solver(
+        step_fn,
+        num_steps=num_steps,
+        default_x0=default_x0,
+        clip_non_negative=True,
+    )
+    return step_fn, solve_batch, solve_single
 
 
-class LotkaVolterra(Simulator):
+@functools.lru_cache(maxsize=32)
+def _get_lv_ode_ll_bundle(
+    dt: float,
+    inner_steps: int,
+    sigma1: float,
+    sigma2: float,
+    num_steps: int,
+    param_transform: str,
+    param_order: str,
+    default_x0: tuple[float, float],
+    obs_sigma: float,
+    ll_kind: str,
+):
+    """Lazily build and cache a specific Lotka-Volterra ODE log-likelihood and batched vmap."""
+    _, _, solve_single = _get_lv_solver_bundle(
+        dt,
+        inner_steps,
+        sigma1,
+        sigma2,
+        num_steps,
+        "ode",
+        param_transform,
+        param_order,
+        default_x0,
+    )
+    base_u0 = jnp.asarray(default_x0, dtype=jnp.float32)
+    if ll_kind == "stats":
+        ll_fn = _build_lv_stats_ll(solve_single, default_x0=base_u0)
+    elif ll_kind == "lognormal":
+        ll_fn = _build_lv_lognormal_ll(
+            solve_single, default_x0=base_u0, obs_sigma=obs_sigma
+        )
+    else:
+        ll_fn = build_ode_ll(solve_single, obs_dim=2, obs_sigma=obs_sigma)
+    return ll_fn, build_batched_ll(ll_fn, stochastic=False)
+
+
+@functools.lru_cache(maxsize=32)
+def _get_lv_mcmc_bundle(
+    dt: float,
+    inner_steps: int,
+    sigma1: float,
+    sigma2: float,
+    num_steps: int,
+    obs_sigma: float,
+    mode: str,
+    param_transform: str,
+    param_order: str,
+    default_x0: tuple[float, float],
+    ll_kind: str,
+    prior_type: str,
+    prior_low: float,
+    prior_high: float,
+    prior_loc: tuple[float, ...] | None,
+    prior_scale: tuple[float, ...] | None,
+    default_init_theta: tuple[float, ...],
+):
+    """Build and cache Lotka-Volterra JAX MCMC sampler and batched likelihood."""
+    if mode == "ode":
+        ll_fn, v_ll_fn = _get_lv_ode_ll_bundle(
+            dt,
+            inner_steps,
+            sigma1,
+            sigma2,
+            num_steps,
+            param_transform,
+            param_order,
+            default_x0,
+            obs_sigma,
+            ll_kind,
+        )
+        jax_mcmc = build_mh_mcmc_sampler(
+            ll_fn,
+            dim_parameters=4,
+            prior_type=prior_type,
+            prior_low=prior_low,
+            prior_high=prior_high,
+            prior_loc=prior_loc,
+            prior_scale=prior_scale,
+            default_init_theta=default_init_theta,
+        )
+        return v_ll_fn, jax_mcmc
+
+    step_fn, _, _ = _get_lv_solver_bundle(
+        dt,
+        inner_steps,
+        sigma1,
+        sigma2,
+        num_steps,
+        mode,
+        param_transform,
+        param_order,
+        default_x0,
+    )
+    pf_ll_fn = build_particle_filter_ll(step_fn, obs_dim=2, obs_sigma=obs_sigma)
+    v_ll_fn = build_batched_ll(pf_ll_fn, stochastic=True)
+    jax_mcmc = build_gibbs_pmmh_sampler(pf_ll_fn, dim_parameters=4)
+    return v_ll_fn, jax_mcmc
+
+
+class LotkaVolterra(DynamicalSimulator):
     r"""Lotka-Volterra Predator-Prey Simulator (SDE and ODE modes, with presets).
 
     Presets:
     --------
-    - "markovsbi" (default):
-      Configuration matching markovsbi task:
-      * Initial state: $u_0 = [1.0, 0.5]^T$ (normalized population densities)
-      * Parameter transform: shifted sigmoid rates in $(1.0, 3.0)$ via $\text{rate} = 2 \cdot \sigma(\theta) + 1$
-      * Parameter ordering: $(\alpha, \beta, \gamma, \delta)$
-      * Prior: Standard Normal $\boldsymbol{\theta} \sim \mathcal{N}(0, I_4)$
-      * Time discretization: $dt = 0.02, \text{inner\_steps} = 5 \implies \Delta t_{\text{obs}} = 0.10$
-      * Trajectory length: $T = 1.0$ with `num_steps = 11`
-      * Default mode: `"sde"` with diffusion noise $\sigma_1 = \sigma_2 = 0.1$
-      * Default summary: `None` (raw flattened trajectory of shape $(22,)$)
-
-    - "sbibm" (Lueckmann et al., 2021, arXiv:2101.04653, Task 'lotka_volterra'):
-      * Initial state: $u_0 = [30.0, 1.0]^T$ (Prey $X(0) = 30$, Predator $Y(0) = 1$)
-      * Parameter transform: identity (direct positive rates $(\alpha, \beta, \gamma, \delta)$)
-      * Prior: $\alpha \sim \text{LogNormal}(-0.125, 0.5)$, $\beta \sim \text{LogNormal}(-3.0, 0.5)$,
-        $\gamma \sim \text{LogNormal}(-0.125, 0.5)$, $\delta \sim \text{LogNormal}(-3.0, 0.5)$
-      * Time discretization: $T = 20.0$ evaluated at 10 evenly-spaced points (`num_steps = 10`, $\Delta t_{\text{obs}} = 20/9$)
-      * Default mode: `"ode"` (deterministic dynamical system, RK4 integration)
-      * Default summary: `"lognormal"` ($y_{k,i} \sim \text{LogNormal}(\log X_k(t_i), 0.1)$, shape $(20,)$)
-
-    - "papamakarios" (alias: "snl"):
-      Configuration matching Papamakarios et al. (2019) (arXiv:1805.07226, Appendix A.3 & B.3):
-      * Initial state: $u_0 = [100.0, 50.0]^T$ (Prey $Y_0 = 100$, Predator $X_0 = 50$)
-      * Parameter transform: exponential log-rates $\text{rate} = \exp(\theta)$
-      * Parameter ordering: $\boldsymbol{\theta} = (\delta, \gamma, \alpha, \beta)$ (predator birth, death, prey birth, predation)
-      * Prior: Uniform broad prior $\boldsymbol{\theta} \sim \mathcal{U}(-5, 2)^4$
-      * Time discretization: $dt = 0.01, \text{inner\_steps} = 20 \implies \Delta t_{\text{obs}} = 0.20$
-      * Trajectory length: $T = 30.0$ with `num_steps = 151`
-      * Default mode: `"ode"` (deterministic dynamical system)
-      * Default summary: `"stats"` (9 summary statistics)
-      * Ground truth: $\boldsymbol{\theta}^* = (\log 0.01, \log 0.5, \log 1, \log 0.01) \approx (-4.605, -0.693, 0.0, -4.605)$
-
-    Mathematical Model:
-    -------------------
-    The state is a 2D vector $x(t) = [x_0(t), x_1(t)]^T$ representing the prey ($x_0$)
-    and predator ($x_1$) populations over continuous time $t \ge 0$.
-
-    - SDE Mode (`mode="sde"`):
-      Stochastic differential equation with state-dependent multiplicative diffusion:
-          $$dx_0 = (\alpha x_0 - \beta x_0 x_1) \, dt + \sigma_1 x_0 x_1 \, dW_0$$
-          $$dx_1 = (-\gamma x_1 + \delta x_0 x_1) \, dt + \sigma_2 x_1 x_0 \, dW_1$$
-    - ODE Mode (`mode="ode"`):
-      Deterministic dynamical system:
-          $$\frac{dx_0}{dt} = \alpha x_0 - \beta x_0 x_1$$
-          $$\frac{dx_1}{dt} = -\gamma x_1 + \delta x_0 x_1$$
+    - ``"markovsbi"`` (default): SDE mode with shifted-sigmoid rates in ``(1, 3)`` and ``N(0, I_4)`` prior.
+    - ``"sbibm"``: ODE mode matching Lueckmann et al. (2021) with LogNormal prior and ``"lognormal"`` obs.
+    - ``"papamakarios"`` (alias ``"snl"``): ODE mode matching Papamakarios et al. (2019) with Uniform(-5, 2)^4 prior and 9 summary stats.
     """
 
     def __init__(
@@ -275,7 +395,7 @@ class LotkaVolterra(Simulator):
         sigma2: float | None = None,
         num_steps: int | None = None,
         obs_sigma: float | None = None,
-        summary: str | None = _SENTINEL,
+        summary: str | None | _UnsetType = _UNSET,
         mode: str | None = None,
         preset: str = "markovsbi",
         u0: torch.Tensor | None = None,
@@ -284,7 +404,6 @@ class LotkaVolterra(Simulator):
         param_order: str | None = None,
         **kwargs,
     ):
-        self.dim_parameters = dim_parameters
         if dim_parameters != 4:
             raise ValueError(
                 f"LotkaVolterra requires dim_parameters=4 (alpha, beta, "
@@ -292,105 +411,82 @@ class LotkaVolterra(Simulator):
             )
 
         preset_key = preset.lower()
-        if preset_key == "sbibm":
-            self.preset = "sbibm"
-            default_dt = 20.0 / 9.0 / 200.0
-            default_inner_steps = 200
-            default_sigma1 = 0.0
-            default_sigma2 = 0.0
-            default_num_steps = 10
-            default_obs_sigma = 0.1
-            default_mode = "ode"
-            default_u0 = torch.tensor([30.0, 1.0], dtype=torch.float32)
-            default_summary = "lognormal"
-            default_transform = "identity"
-            default_order = "alphabetical"
-        elif preset_key in ("papamakarios", "snl"):
-            self.preset = "papamakarios"
-            default_dt = 0.01
-            default_inner_steps = 20
-            default_sigma1 = 0.0
-            default_sigma2 = 0.0
-            default_num_steps = 151
-            default_obs_sigma = 0.05
-            default_mode = "ode"
-            default_u0 = torch.tensor([100.0, 50.0], dtype=torch.float32)
-            default_summary = "stats"
-            default_transform = "exp"
-            default_order = "paper"
-        elif preset_key == "markovsbi":
-            self.preset = "markovsbi"
-            default_dt = 0.02
-            default_inner_steps = 5
-            default_sigma1 = 0.1
-            default_sigma2 = 0.1
-            default_num_steps = 11
-            default_obs_sigma = 0.05
-            default_mode = "sde"
-            default_u0 = torch.tensor([1.0, 0.5], dtype=torch.float32)
-            default_summary = None
-            default_transform = "sigmoid"
-            default_order = "alphabetical"
-        else:
+        if preset_key == "snl":
+            preset_key = "papamakarios"
+        if preset_key not in _LV_PRESETS:
             raise ValueError(
                 f"Unknown preset '{preset}'. Supported presets are 'markovsbi', 'sbibm', and 'papamakarios'."
             )
+        cfg = _LV_PRESETS[preset_key]
+        self.preset = preset_key
 
-        self.dt = default_dt if dt is None else dt
-        self.inner_steps = default_inner_steps if inner_steps is None else inner_steps
-        self.sigma1 = default_sigma1 if sigma1 is None else sigma1
-        self.sigma2 = default_sigma2 if sigma2 is None else sigma2
-        self.num_steps = default_num_steps if num_steps is None else num_steps
-        self.obs_sigma = default_obs_sigma if obs_sigma is None else obs_sigma
+        self.dt = float(cfg.dt if dt is None else dt)
+        self.inner_steps = int(cfg.inner_steps if inner_steps is None else inner_steps)
+        self.sigma1 = float(cfg.sigma1 if sigma1 is None else sigma1)
+        self.sigma2 = float(cfg.sigma2 if sigma2 is None else sigma2)
+        resolved_num_steps = int(cfg.num_steps if num_steps is None else num_steps)
+        resolved_obs_sigma = float(cfg.obs_sigma if obs_sigma is None else obs_sigma)
 
-        mode_str = (default_mode if mode is None else mode).lower()
+        mode_str = (cfg.mode if mode is None else mode).lower()
         if mode_str not in ("sde", "ode"):
             raise ValueError(f"mode must be 'sde' or 'ode', got '{mode_str}'.")
         self.mode = mode_str
 
         self.param_transform = (
-            default_transform if param_transform is None else param_transform.lower()
+            cfg.param_transform
+            if param_transform is None
+            else param_transform.lower()
         )
-        self.param_order = default_order if param_order is None else param_order.lower()
-        self.u0 = default_u0 if u0 is None else torch.as_tensor(u0, dtype=torch.float32)
+        self.param_order = (
+            cfg.param_order if param_order is None else param_order.lower()
+        )
 
-        self.dim_data_raw = int(2 * self.num_steps)
+        resolved_u0 = (
+            torch.tensor(cfg.u0, dtype=torch.float32)
+            if u0 is None
+            else torch.as_tensor(u0, dtype=torch.float32)
+        )
+        u0_tuple = (float(resolved_u0[0].item()), float(resolved_u0[1].item()))
 
-        resolved_summary = default_summary if summary is _SENTINEL else summary
-        if resolved_summary is None or resolved_summary in ("subsample", "lognormal"):
-            self.dim_data = self.dim_data_raw
-        elif resolved_summary in ("stats", "summary_stats"):
-            self.dim_data = 9
-        elif resolved_summary == "two_step":
-            self.dim_data = 4
-        else:
-            raise NotImplementedError(f"Unknown summary mode: {resolved_summary}")
-        self.summary = resolved_summary
+        resolved_summary = cfg.summary if isinstance(summary, _UnsetType) else summary
+        dim_raw = int(2 * resolved_num_steps)
+        dim_data = self._resolve_summary_dim(
+            resolved_summary,
+            dim_raw=dim_raw,
+            dim_stats=9,
+            dim_two_step=4,
+            extra_modes={"lognormal": dim_raw},
+        )
 
-        super().__init__(seed, self.dim_parameters, self.dim_data, **kwargs)
+        super().__init__(
+            seed=seed,
+            dim_parameters=dim_parameters,
+            dim_data=dim_data,
+            state_dim=2,
+            num_steps=resolved_num_steps,
+            obs_sigma=resolved_obs_sigma,
+            summary=resolved_summary,
+            u0=resolved_u0,
+            **kwargs,
+        )
 
         if prior is not None:
             self.prior_dist = prior
             self.canonical_theta = torch.zeros(4, dtype=torch.float32)
         elif self.preset == "sbibm":
-            # Prior from Lueckmann et al. (2021) (arXiv:2101.04653):
-            # alpha, gamma ~ LogNormal(-0.125, 0.5), beta, delta ~ LogNormal(-3.0, 0.5)
-            self.prior_loc = [-0.125, -3.0, -0.125, -3.0]
-            self.prior_scale = [0.5, 0.5, 0.5, 0.5]
+            assert cfg.prior_loc is not None and cfg.prior_scale is not None
             self.prior_dist = pdist.LogNormal(
-                loc=torch.tensor(self.prior_loc, dtype=torch.float32),
-                scale=torch.tensor(self.prior_scale, dtype=torch.float32),
+                loc=torch.tensor(cfg.prior_loc, dtype=torch.float32),
+                scale=torch.tensor(cfg.prior_scale, dtype=torch.float32),
             ).to_event(1)
             self.canonical_theta = torch.exp(
-                torch.tensor(self.prior_loc, dtype=torch.float32)
+                torch.tensor(cfg.prior_loc, dtype=torch.float32)
             )
         elif self.preset == "papamakarios":
-            # Broad prior from Papamakarios et al. (2019): Uniform(-5, 2)^4
             self.prior_dist = pdist.Uniform(
                 low=torch.full((4,), -5.0, dtype=torch.float32),
                 high=torch.full((4,), 2.0, dtype=torch.float32),
             ).to_event(1)
-            # Ground truth parameters from paper: (log 0.01, log 0.5, log 1, log 0.01)
             if self.param_order == "paper":
                 self.canonical_theta = torch.tensor(
                     [-4.605170, -0.693147, 0.0, -4.605170], dtype=torch.float32
@@ -400,204 +496,93 @@ class LotkaVolterra(Simulator):
                     [0.0, -4.605170, -0.693147, -4.605170], dtype=torch.float32
                 )
         else:
-            # Standard Normal N(0, I_4) matching markovsbi
-            self.prior_loc = [0.0, 0.0, 0.0, 0.0]
-            self.prior_scale = [1.0, 1.0, 1.0, 1.0]
             self.prior_dist = pdist.Normal(
                 loc=torch.zeros(4, dtype=torch.float32),
                 scale=torch.ones(4, dtype=torch.float32),
             ).to_event(1)
             self.canonical_theta = torch.zeros(4, dtype=torch.float32)
 
-        # PRNG state management
-        self._rng_key = jax.random.PRNGKey(self.seed)
-
-        # Build JAX solver
-        self._step_fn = _build_lv_step_fn(
-            dt=self.dt,
-            inner_steps=self.inner_steps,
-            sigma1=self.sigma1,
-            sigma2=self.sigma2,
-            mode=self.mode,
-            param_transform=self.param_transform,
-            param_order=self.param_order,
-        )
-        self._jax_solver_batch, self._jax_solver_single = _build_lv_sde_jax_solver(
-            self._step_fn,
-            num_steps=self.num_steps,
-            default_x0=jnp.asarray(self.u0.detach().cpu().numpy()),
+        self._u0_tuple = u0_tuple
+        _, self._jax_solver_batch, _ = _get_lv_solver_bundle(
+            self.dt,
+            self.inner_steps,
+            self.sigma1,
+            self.sigma2,
+            self.num_steps,
+            self.mode,
+            self.param_transform,
+            self.param_order,
+            self._u0_tuple,
         )
 
-        if self.preset == "sbibm":
-            prior_type = "lognormal"
-        elif self.preset == "papamakarios":
-            prior_type = "uniform"
+        if self.summary in ("stats", "summary_stats"):
+            ll_kind = "stats"
+        elif self.summary == "lognormal":
+            ll_kind = "lognormal"
         else:
-            prior_type = "gaussian"
+            ll_kind = "ode"
+        self._default_ll_kind = ll_kind
 
-        base_u0_jax = jnp.asarray(self.u0.detach().cpu().numpy())
-
-        if self.mode == "ode":
-            self._stats_ll_fn = _build_lv_stats_ll(
-                self._jax_solver_single,
-                default_x0=base_u0_jax,
-            )
-            self._lognormal_ll_fn = _build_lv_lognormal_ll(
-                self._jax_solver_single,
-                default_x0=base_u0_jax,
-                obs_sigma=self.obs_sigma,
-            )
-            self._ode_ll_fn = build_ode_ll(
-                self._jax_solver_single,
-                obs_dim=2,
-                obs_sigma=self.obs_sigma,
-            )
-            if self.summary in ("stats", "summary_stats"):
-                active_ll_fn = self._stats_ll_fn
-            elif self.summary == "lognormal":
-                active_ll_fn = self._lognormal_ll_fn
-            else:
-                active_ll_fn = self._ode_ll_fn
-            self._jax_mcmc = build_mh_mcmc_sampler(
-                active_ll_fn,
-                dim_parameters=self.dim_parameters,
-                prior_type=prior_type,
-                prior_low=-5.0,
-                prior_high=2.0,
-                prior_loc=tuple(self.prior_loc) if self.preset == "sbibm" else None,
-                prior_scale=tuple(self.prior_scale) if self.preset == "sbibm" else None,
-                default_init_theta=tuple(float(v) for v in self.canonical_theta.tolist()),
-            )
-        else:
-            self._pf_ll_fn = build_particle_filter_ll(
-                self._step_fn,
-                obs_dim=2,
-                obs_sigma=self.obs_sigma,
-            )
-            self._jax_mcmc = build_gibbs_pmmh_sampler(
-                self._pf_ll_fn,
-                dim_parameters=self.dim_parameters,
-            )
-
-    def _next_rng_key(self) -> jax.Array:
-        self._rng_key, subkey = jax.random.split(self._rng_key)
-        return subkey
-
-    def reset_rng(self, seed: int | None = None) -> None:
-        """Reset internal PRNG state for reproducibility."""
-        if seed is not None:
-            self.seed = seed
-        self._rng_key = jax.random.PRNGKey(self.seed)
-        pyro.set_rng_seed(self.seed)
-        torch.manual_seed(self.seed)
-
-    def _solve(
-        self,
-        parameters: torch.Tensor,
-        u0: torch.Tensor | None = None,
-        rng_key: jax.Array | None = None,
-    ) -> torch.Tensor:
-        """Batched simulation accelerated via JAX.
-
-        parameters: (num_samples, 4) tensor of raw thetas
-        u0: optional (num_samples, 2) tensor of initial states
-        returns: (num_samples, 2, num_steps) tensor
-        """
-        params_np = parameters.detach().cpu().numpy().astype(np.float32)
-        params_jax = jnp.asarray(params_np)
-        batch_size = params_jax.shape[0]
-
-        if rng_key is None:
-            rng_key = self._next_rng_key()
-        keys = jax.random.split(rng_key, batch_size)
-
-        if u0 is not None:
-            u0_np = u0.detach().cpu().numpy().astype(np.float32)
-            u0_jax = jnp.asarray(u0_np)
-            res_jax = self._jax_solver_batch(keys, params_jax, u0_jax)
-        else:
-            res_jax = self._jax_solver_batch(keys, params_jax)
-
-        res_np = np.array(res_jax, copy=True)
-        return torch.from_numpy(res_np)
+        canon_tuple = tuple(float(v) for v in self.canonical_theta.tolist())
+        self._v_ll_fn, self._jax_mcmc = _get_lv_mcmc_bundle(
+            self.dt,
+            self.inner_steps,
+            self.sigma1,
+            self.sigma2,
+            self.num_steps,
+            self.obs_sigma,
+            self.mode,
+            self.param_transform,
+            self.param_order,
+            self._u0_tuple,
+            ll_kind,
+            cfg.prior_type,
+            cfg.prior_low if cfg.prior_low is not None else -5.0,
+            cfg.prior_high if cfg.prior_high is not None else 2.0,
+            cfg.prior_loc,
+            cfg.prior_scale,
+            canon_tuple,
+        )
 
     def get_prior_x0(self) -> pdist.Distribution:
-        """Prior over initial condition x0 = [prey, predator]."""
-        if self.preset in ("sbibm", "papamakarios"):
-            return pdist.Uniform(
-                low=torch.tensor([0.0, 0.0], dtype=torch.float32),
-                high=torch.tensor([200.0, 200.0], dtype=torch.float32),
-            ).to_event(1)
+        """Prior over initial condition ``x0 = [prey, predator]``."""
+        high = 200.0 if self.preset in ("sbibm", "papamakarios") else 10.0
         return pdist.Uniform(
-            low=torch.tensor([0.0, 0.0], dtype=torch.float32),
-            high=torch.tensor([10.0, 10.0], dtype=torch.float32),
+            low=torch.zeros(2, dtype=torch.float32),
+            high=torch.full((2,), high, dtype=torch.float32),
         ).to_event(1)
 
     @staticmethod
+    @override
     def compute_summary_stats(us: torch.Tensor) -> torch.Tensor:
-        """Compute 9 summary statistics from (num_samples, 2, T) trajectory tensor."""
-        is_2d_traj = us.ndim == 2
-        if is_2d_traj:
-            us = us.unsqueeze(0)
+        """Compute 9 summary statistics from ``(num_samples, 2, T)`` trajectory tensor."""
+        return trajectory_stats_2d_lv(us)
 
-        eps = 1e-6
-        x = us[:, 0, :]
-        y = us[:, 1, :]
-
-        mean_x = x.mean(dim=-1, keepdim=True)
-        mean_y = y.mean(dim=-1, keepdim=True)
-
-        dx = x - mean_x
-        dy = y - mean_y
-
-        var_x = (dx**2).mean(dim=-1, keepdim=True)
-        var_y = (dy**2).mean(dim=-1, keepdim=True)
-
-        log_var_x = torch.log(var_x.clamp_min(eps))
-        log_var_y = torch.log(var_y.clamp_min(eps))
-
-        T = us.shape[-1]
-        denom_x = var_x.clamp_min(eps)
-        denom_y = var_y.clamp_min(eps)
-
-        if T >= 2:
-            ac1_x = (dx[:, 1:] * dx[:, :-1]).mean(dim=-1, keepdim=True) / denom_x
-            ac1_y = (dy[:, 1:] * dy[:, :-1]).mean(dim=-1, keepdim=True) / denom_y
+    def _extract_rates_torch(
+        self, params: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.param_transform == "identity":
+            rates = params
+        elif self.param_transform == "exp":
+            rates = torch.exp(params)
         else:
-            ac1_x = torch.zeros_like(mean_x)
-            ac1_y = torch.zeros_like(mean_y)
+            rates = torch.sigmoid(params) * 2.0 + 1.0
+        if self.param_order == "paper":
+            return rates[:, 2], rates[:, 3], rates[:, 1], rates[:, 0]
+        return rates[:, 0], rates[:, 1], rates[:, 2], rates[:, 3]
 
-        if T >= 3:
-            ac2_x = (dx[:, 2:] * dx[:, :-2]).mean(dim=-1, keepdim=True) / denom_x
-            ac2_y = (dy[:, 2:] * dy[:, :-2]).mean(dim=-1, keepdim=True) / denom_y
-        else:
-            ac2_x = torch.zeros_like(mean_x)
-            ac2_y = torch.zeros_like(mean_y)
-
-        denom_xy = torch.sqrt(denom_x * denom_y)
-        cc_xy = (dx * dy).mean(dim=-1, keepdim=True) / denom_xy
-
-        ac1_x = torch.nan_to_num(ac1_x.clamp(-1.0, 1.0), nan=0.0)
-        ac2_x = torch.nan_to_num(ac2_x.clamp(-1.0, 1.0), nan=0.0)
-        ac1_y = torch.nan_to_num(ac1_y.clamp(-1.0, 1.0), nan=0.0)
-        ac2_y = torch.nan_to_num(ac2_y.clamp(-1.0, 1.0), nan=0.0)
-        cc_xy = torch.nan_to_num(cc_xy.clamp(-1.0, 1.0), nan=0.0)
-
-        stats = torch.cat(
-            [
-                mean_x,
-                mean_y,
-                log_var_x,
-                log_var_y,
-                ac1_x,
-                ac2_x,
-                ac1_y,
-                ac2_y,
-                cc_xy,
-            ],
-            dim=-1,
-        )
-        return stats.squeeze(0) if is_2d_traj else stats
+    @staticmethod
+    def _drift_torch(
+        u: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        gamma: torch.Tensor,
+        delta: torch.Tensor,
+    ) -> torch.Tensor:
+        p0, p1 = u[:, 0], u[:, 1]
+        dx0 = alpha * p0 - beta * p0 * p1
+        dx1 = -gamma * p1 + delta * p0 * p1
+        return torch.stack([dx0, dx1], dim=-1)
 
     def stepper(
         self,
@@ -606,265 +591,123 @@ class LotkaVolterra(Simulator):
         dt: float | None = None,
         sigma: float | None = None,
     ) -> torch.Tensor:
-        """Simulate a single time-series step transition for Lotka-Volterra SDE.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Current state [x0, x1], shape (2,) or (batch_size, 2).
-        parameters : torch.Tensor
-            Lotka-Volterra parameters (raw theta in R^4 or rates),
-            shape (4,) or (batch_size, 4).
-        dt : float, optional
-            Step time interval (default: self.dt * self.inner_steps = 0.1).
-        sigma : float, optional
-            Diffusion level (default: self.sigma1 = 0.1).
-
-        Returns
-        -------
-        torch.Tensor
-            Next state [x0, x1] of shape (2,) or (batch_size, 2).
-        """
-        x_t = torch.as_tensor(x, dtype=torch.float32)
-        params = torch.as_tensor(parameters, dtype=torch.float32)
-
-        is_1d = x_t.ndim == 1
-        if is_1d:
-            x_t = x_t.unsqueeze(0)
-        if params.ndim == 1:
-            params = params.unsqueeze(0)
-        if params.shape[0] == 1 and x_t.shape[0] > 1:
-            params = params.expand(x_t.shape[0], -1)
-        elif x_t.shape[0] == 1 and params.shape[0] > 1:
-            x_t = x_t.expand(params.shape[0], -1)
-
+        """Simulate a single observation-step transition for Lotka-Volterra."""
+        x_t, params, is_1d = self._broadcast_stepper_inputs(x, parameters)
         sig1 = float(self.sigma1 if sigma is None else sigma)
         sig2 = float(self.sigma2 if sigma is None else sigma)
-
-        # Parameter mapping
-        if self.param_transform == "identity":
-            if self.param_order == "paper":
-                delta, gamma, alpha, beta = params[:, 0], params[:, 1], params[:, 2], params[:, 3]
-            else:
-                alpha, beta, gamma, delta = params[:, 0], params[:, 1], params[:, 2], params[:, 3]
-        elif self.param_transform == "exp":
-            if self.param_order == "paper":
-                delta = torch.exp(params[:, 0])
-                gamma = torch.exp(params[:, 1])
-                alpha = torch.exp(params[:, 2])
-                beta = torch.exp(params[:, 3])
-            else:
-                alpha = torch.exp(params[:, 0])
-                beta = torch.exp(params[:, 1])
-                gamma = torch.exp(params[:, 2])
-                delta = torch.exp(params[:, 3])
-        else:
-            if self.param_order == "paper":
-                delta = torch.sigmoid(params[:, 0]) * 2.0 + 1.0
-                gamma = torch.sigmoid(params[:, 1]) * 2.0 + 1.0
-                alpha = torch.sigmoid(params[:, 2]) * 2.0 + 1.0
-                beta = torch.sigmoid(params[:, 3]) * 2.0 + 1.0
-            else:
-                alpha = torch.sigmoid(params[:, 0]) * 2.0 + 1.0
-                beta = torch.sigmoid(params[:, 1]) * 2.0 + 1.0
-                gamma = torch.sigmoid(params[:, 2]) * 2.0 + 1.0
-                delta = torch.sigmoid(params[:, 3]) * 2.0 + 1.0
+        alpha, beta, gamma, delta = self._extract_rates_torch(params)
 
         step_dt = float(self.dt * self.inner_steps if dt is None else dt)
-        sub_dt = float(self.dt)
-        n_substeps = max(round(step_dt / sub_dt), 1)
+        n_substeps = max(round(step_dt / self.dt), 1)
         actual_h = step_dt / n_substeps
+        sqrt_h = math.sqrt(actual_h)
 
         curr_u = torch.clamp(x_t.clone(), min=0.0)
-
         for _ in range(n_substeps):
-            p0 = curr_u[:, 0]
-            p1 = curr_u[:, 1]
-            dx0 = alpha * p0 - beta * p0 * p1
-            dx1 = -gamma * p1 + delta * p0 * p1
-            drift_step = torch.stack([dx0, dx1], dim=-1)
-
             if self.mode == "ode":
-                curr_u = torch.clamp(curr_u + drift_step * actual_h, min=0.0)
+                k1 = self._drift_torch(curr_u, alpha, beta, gamma, delta)
+                k2 = self._drift_torch(
+                    torch.clamp(curr_u + 0.5 * actual_h * k1, min=0.0),
+                    alpha,
+                    beta,
+                    gamma,
+                    delta,
+                )
+                k3 = self._drift_torch(
+                    torch.clamp(curr_u + 0.5 * actual_h * k2, min=0.0),
+                    alpha,
+                    beta,
+                    gamma,
+                    delta,
+                )
+                k4 = self._drift_torch(
+                    torch.clamp(curr_u + actual_h * k3, min=0.0),
+                    alpha,
+                    beta,
+                    gamma,
+                    delta,
+                )
+                curr_u = torch.clamp(
+                    curr_u + (actual_h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4),
+                    min=0.0,
+                )
             else:
-                dW = torch.randn_like(curr_u) * math.sqrt(actual_h)
-                diff_0 = sig1 * p0 * p1 * dW[:, 0]
-                diff_1 = sig2 * p1 * p0 * dW[:, 1]
-                diff_step = torch.stack([diff_0, diff_1], dim=-1)
+                p0, p1 = curr_u[:, 0], curr_u[:, 1]
+                drift_step = self._drift_torch(curr_u, alpha, beta, gamma, delta)
+                d_w = torch.randn_like(curr_u) * sqrt_h
+                diff_step = torch.stack(
+                    [sig1 * p0 * p1 * d_w[:, 0], sig2 * p1 * p0 * d_w[:, 1]], dim=-1
+                )
                 curr_u = torch.clamp(
                     curr_u + drift_step * actual_h + diff_step, min=0.0
                 )
 
         return curr_u.squeeze(0) if is_1d else curr_u
 
-    def simulate_two_step(
-        self,
-        parameters: torch.Tensor,
-        x0: torch.Tensor | None = None,
-        t: int | torch.Tensor | None = None,
-        informed: bool = True,
-        return_dict: bool = False,
-    ) -> torch.Tensor | dict[str, torch.Tensor]:
-        """Generate two-step transition pairs (x_t, x_{t+1}) like in markovsbi."""
-        return sample_two_step(
-            self,
-            parameters=parameters,
-            x0=x0,
-            t=t,
-            informed=informed,
-            return_dict=return_dict,
-        )
-
     @override
-    def simulate(self, parameters: torch.Tensor | np.ndarray) -> torch.Tensor:
-        parameters = torch.as_tensor(parameters, dtype=torch.float32)
-
-        if parameters.numel() == 0:
-            raise ValueError("Expected at least one parameter.")
-
-        is_1d = parameters.ndim == 1
-        if is_1d:
-            parameters = parameters.unsqueeze(0)
-
-        num_samples = parameters.shape[0]
-
-        if self.summary == "two_step":
-            pairs = self.simulate_two_step(parameters, return_dict=False)
-            pairs_flat = pairs.reshape(num_samples, 4)
-            return pairs_flat.squeeze(0) if is_1d else pairs_flat
-
-        us = self._solve(parameters)  # (num_samples, 2, num_steps)
-        us = us.float()
-
-        has_nan = torch.isnan(us.reshape(num_samples, -1)).any(dim=1)
-        idx_contains_nan = torch.where(has_nan)[0]
-        idx_contains_no_nan = torch.where(~has_nan)[0]
-
-        if self.summary is None:
-            # Flatten to (num_samples, dim_data)
-            traj_flat = us.reshape(num_samples, -1)
-            return traj_flat.squeeze(0) if is_1d else traj_flat
-
-        if self.summary in ("subsample", "lognormal"):
-            data = torch.full(
-                (num_samples, self.dim_data),
-                float("nan"),
-                dtype=torch.float32,
-            )
-
-            if len(idx_contains_nan) == num_samples:
-                return data.squeeze(0) if is_1d else data
-
-            raw_data = us[idx_contains_no_nan, :, :].reshape(
-                len(idx_contains_no_nan), -1
-            )
-            if self.summary == "lognormal":
-                noise = torch.exp(torch.randn_like(raw_data) * self.obs_sigma)
-                sampled = raw_data * noise
-            else:
-                noise = torch.randn_like(raw_data) * self.obs_sigma
-                sampled = raw_data + noise
-
-            data[idx_contains_no_nan, :] = sampled
-            return data.squeeze(0) if is_1d else data
-
-        if self.summary in ("stats", "summary_stats"):
-            data = torch.full(
-                (num_samples, self.dim_data),
-                float("nan"),
-                dtype=torch.float32,
-            )
-
-            if len(idx_contains_nan) == num_samples:
-                return data.squeeze(0) if is_1d else data
-
-            stats = self.compute_summary_stats(us[idx_contains_no_nan, :, :])
-            data[idx_contains_no_nan, :] = stats
-            return data.squeeze(0) if is_1d else data
-
-        raise ValueError(f"Unknown summary mode: {self.summary}")
+    def _apply_summary(self, us_valid: torch.Tensor) -> torch.Tensor:
+        if self.summary == "lognormal":
+            raw_data = us_valid.reshape(us_valid.shape[0], -1)
+            noise = torch.exp(torch.randn_like(raw_data) * self.obs_sigma)
+            return raw_data * noise
+        return super()._apply_summary(us_valid)
 
     @override
     def get_prior(self) -> pdist.Distribution:
         return self.prior_dist
 
-    def log_likelihood(
-        self, parameters: torch.Tensor, x_obs: torch.Tensor, n_particles: int = 150
-    ) -> torch.Tensor:
-        r"""Evaluate marginal log-likelihood $\log p(y_{1:T} \mid \theta)$.
+    def _prepare_ode_obs(self, x_obs: torch.Tensor | np.ndarray) -> tuple[jax.Array, str]:
+        """Determine whether ``x_obs`` represents summary stats or trajectory and convert."""
+        x_obs_t = torch.as_tensor(
+            np.array(x_obs, copy=True) if isinstance(x_obs, np.ndarray) else x_obs,
+            dtype=torch.float32,
+        )
+        if x_obs_t.ndim == 2 and x_obs_t.shape[0] == 1:
+            x_obs_t = x_obs_t.squeeze(0)
 
-        Mathematical Formulation:
-        -------------------------
-        - ODE Mode: Exact log-likelihood under deterministic trajectory $x_t(\theta)$ with $x_0 = y_0$:
-              $$\log p(y_{1:T} \mid \theta) = -\frac{1}{2 \sigma_{\text{obs}}^2} \sum_{t=1}^{T-1} \| y_t - x_t(\theta) \|_2^2 - (T-1) \left( 2 \log \sigma_{\text{obs}} + \log(2\pi) \right)$$
-        - SDE Mode: Marginal log-likelihood integrating out the unobserved diffusion path:
-              $$\log p(y_{1:T} \mid \theta) = \log \int p(y_{1:T}, x_{1:T} \mid \theta) \, dx_{1:T}$$
-          estimated unbiasedly using a JAX-accelerated Sequential Monte Carlo (SMC) bootstrap
-          particle filter with $N = \text{n\_particles}$ particles and systematic resampling.
-
-        Parameters
-        ----------
-        parameters : torch.Tensor
-            Latent parameter tensor $\theta \in \mathbb{R}^4$, shape `(4,)` or `(batch_size, 4)`.
-        x_obs : torch.Tensor
-            Observed trajectory $y_{1:T}$, shape `(2 * num_steps,)`, `(2, num_steps)`,
-            or `(num_steps, 2)`.
-        n_particles : int, optional
-            Number of particles for the SMC particle filter in SDE mode (default: 150).
-
-        Returns
-        -------
-        torch.Tensor
-            Log-likelihood values of shape `(batch_size,)`.
-        """
-        parameters = torch.as_tensor(parameters, dtype=torch.float32)
-        if parameters.ndim == 1:
-            parameters = parameters.unsqueeze(0)
-
-        num_samples = parameters.shape[0]
-        if isinstance(x_obs, np.ndarray):
-            x_obs = np.array(x_obs, copy=True)
-        x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
-        if x_obs_tensor.ndim == 2 and x_obs_tensor.shape[0] == 1:
-            x_obs_tensor = x_obs_tensor.squeeze(0)
-
-        # Support 9 summary statistics in ODE mode
         if (
-            x_obs_tensor.numel() == 9
+            x_obs_t.numel() == 9
             and self.summary in ("stats", "summary_stats")
             and self.mode == "ode"
         ):
-            x_jax = jnp.asarray(x_obs_tensor.flatten().detach().cpu().numpy())
-            params_jax = jnp.asarray(parameters.detach().cpu().numpy())
-            v_ll = jax.vmap(lambda th: self._stats_ll_fn(th, x_jax))
-            lls_jax = v_ll(params_jax)
-            return torch.from_numpy(np.array(lls_jax, copy=True))
+            return jnp.asarray(x_obs_t.flatten().detach().cpu().numpy()), "stats"
 
-        if x_obs_tensor.ndim == 1:
-            x_obs_2d = x_obs_tensor.reshape(2, -1).T
-        elif x_obs_tensor.ndim == 2 and x_obs_tensor.shape == (2, self.num_steps):
-            x_obs_2d = x_obs_tensor.T
-        else:
-            x_obs_2d = x_obs_tensor
+        ll_kind = "lognormal" if self.summary == "lognormal" else "ode"
+        return self._format_trajectory_obs(x_obs_t), ll_kind
 
-        x_jax = jnp.asarray(x_obs_2d.detach().cpu().numpy())
-        params_jax = jnp.asarray(parameters.detach().cpu().numpy())
+    def log_likelihood(
+        self,
+        parameters: torch.Tensor | np.ndarray,
+        x_obs: torch.Tensor | np.ndarray,
+        n_particles: int = 150,
+    ) -> torch.Tensor:
+        """Evaluate marginal log-likelihood ``log p(y_{1:T} | theta)``."""
+        params, _ = self._prepare_parameters(parameters)
+        params_jax = jnp.asarray(params.detach().cpu().numpy(), dtype=jnp.float32)
 
         if self.mode == "ode":
-            if self.summary == "lognormal":
-                v_ll = jax.vmap(lambda th: self._lognormal_ll_fn(th, x_jax))
+            x_jax, ll_kind = self._prepare_ode_obs(x_obs)
+            if ll_kind == self._default_ll_kind:
+                v_ll_fn = self._v_ll_fn
             else:
-                v_ll = jax.vmap(lambda th: self._ode_ll_fn(th, x_jax))
-            lls_jax = v_ll(params_jax)
+                _, v_ll_fn = _get_lv_ode_ll_bundle(
+                    self.dt,
+                    self.inner_steps,
+                    self.sigma1,
+                    self.sigma2,
+                    self.num_steps,
+                    self.param_transform,
+                    self.param_order,
+                    self._u0_tuple,
+                    self.obs_sigma,
+                    ll_kind,
+                )
+            lls_jax = v_ll_fn(params_jax, x_jax)
             return torch.from_numpy(np.array(lls_jax, copy=True))
 
-        key = self._next_rng_key()
-        keys = jax.random.split(key, num_samples)
-
-        v_ll = jax.vmap(
-            lambda th, k: self._pf_ll_fn(th, x_jax, k, n_particles=n_particles)
-        )
-        lls_jax = v_ll(params_jax, keys)
+        x_jax = self._format_trajectory_obs(x_obs)
+        keys = jax.random.split(self._next_rng_key(), params.shape[0])
+        lls_jax = self._v_ll_fn(params_jax, x_jax, keys, n_particles=n_particles)
         return torch.from_numpy(np.array(lls_jax, copy=True))
 
     @override
@@ -879,19 +722,7 @@ class LotkaVolterra(Simulator):
         step_size: float = 0.3,
         **kwargs,
     ) -> torch.Tensor:
-        r"""Sample from the true posterior $p(\theta \mid y_{1:T})$ using JAX MCMC.
-
-        Mathematical Formulation:
-        -------------------------
-        The target posterior distribution is given by Bayes' rule:
-            $$p(\theta \mid y_{1:T}) \propto p(\theta) \, p(y_{1:T} \mid \theta)$$
-
-        Inference Algorithms:
-        ---------------------
-        - ODE Mode: Metropolis-Hastings MCMC with Gaussian random walk proposals,
-          evaluated on either the deterministic summary statistics or trajectory likelihood.
-        - SDE Mode: Gibbs Particle Marginal Metropolis-Hastings (PMMH) sampler.
-        """
+        """Sample from ``p(theta | y_{1:T})`` using JAX MCMC / Gibbs PMMH."""
         is_default_obs = x_obs is None
         if x_obs is None:
             if self.preset in ("sbibm", "papamakarios"):
@@ -899,8 +730,9 @@ class LotkaVolterra(Simulator):
                 if self.summary in ("stats", "summary_stats", "lognormal"):
                     x_obs = self.simulate(th_star)
                 else:
-                    x_ref = self._solve(th_star.unsqueeze(0), u0=self.u0.unsqueeze(0))[0].T
-                    x_obs = x_ref
+                    x_obs = self._solve(
+                        th_star.unsqueeze(0), u0=self.u0.unsqueeze(0)
+                    )[0].T
             else:
                 # Default observation generated from theta = 0 with seed 42 (markovsbi)
                 x_obs = torch.tensor(
@@ -920,32 +752,18 @@ class LotkaVolterra(Simulator):
                     dtype=torch.float32,
                 )
 
-        if isinstance(x_obs, np.ndarray):
-            x_obs = np.array(x_obs, copy=True)
-        x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
-        if x_obs_tensor.ndim == 2 and x_obs_tensor.shape[0] == 1:
-            x_obs_tensor = x_obs_tensor.squeeze(0)
+        if self.mode == "ode":
+            x_jax, _ = self._prepare_ode_obs(x_obs)
+        else:
+            x_jax = self._format_trajectory_obs(x_obs)
 
-        # Check if x_obs is 9 summary statistics in ODE mode
-        if (
-            x_obs_tensor.numel() == 9
-            and self.summary in ("stats", "summary_stats")
-            and self.mode == "ode"
-        ):
-            x_jax = jnp.asarray(x_obs_tensor.flatten().detach().cpu().numpy())
-        else:
-            if x_obs_tensor.ndim == 1:
-                x_obs_2d = x_obs_tensor.reshape(2, -1).T
-            elif x_obs_tensor.ndim == 2 and x_obs_tensor.shape == (2, self.num_steps):
-                x_obs_2d = x_obs_tensor.T
-            else:
-                x_obs_2d = x_obs_tensor
-            x_jax = jnp.asarray(x_obs_2d.detach().cpu().numpy())
-        if self.preset == "markovsbi" and is_default_obs:
-            rng_key = jax.random.PRNGKey(self.seed)
-        else:
-            rng_key = self._next_rng_key()
+        rng_key = (
+            jax.random.PRNGKey(self.seed)
+            if (self.preset == "markovsbi" and is_default_obs)
+            else self._next_rng_key()
+        )
         num_samples_per_chain = math.ceil(num_samples / n_chains)
+
         if self.preset == "papamakarios" and step_size == 0.3:
             eff_step_size = 0.015
         elif self.preset == "sbibm" and step_size == 0.3:
@@ -974,7 +792,4 @@ class LotkaVolterra(Simulator):
                 n_particles=n_particles,
                 step_size=eff_step_size,
             )
-        samples_np = np.array(samples_jax, copy=True)
-        np.random.shuffle(samples_np)
-        samples_torch = torch.from_numpy(samples_np)
-        return samples_torch[:num_samples]
+        return self._finalize_mcmc_samples(samples_jax, num_samples)
