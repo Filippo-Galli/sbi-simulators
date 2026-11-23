@@ -290,6 +290,7 @@ def build_mh_mcmc_sampler(
     prior: PriorSpec,
     default_init_theta: tuple[float, ...] | None = None,
     init_strategy: str | None = None,
+    rescue_stuck_chains: bool = False,
 ):
     """Build a unified JIT-compiled parallel Metropolis-Hastings MCMC sampler in JAX.
 
@@ -300,15 +301,19 @@ def build_mh_mcmc_sampler(
     prior : PriorSpec
         Hashable prior specification governing parameter support, log-prior, and transforms.
     default_init_theta : tuple[float, ...], optional
-        Seed parameter vector used when ``init_strategy == "jitter"``.
-    init_strategy : {"jitter", "sir_argmax", "sir_resample", "prior"}, optional
+        Seed parameter vector used when ``init_strategy == "jitter"``, and appended as an
+        extra candidate when ``init_strategy == "sir_pool"``.
+    init_strategy : {"jitter", "sir_argmax", "sir_resample", "sir_pool", "prior"}, optional
         Chain initialization strategy. Defaults to ``"jitter"`` when
         ``default_init_theta`` is provided, otherwise ``"sir_argmax"``.
+    rescue_stuck_chains : bool, default False
+        When ``True`` and ``adapt_warmup=True``, chains trapped more than 25 nats below the
+        best chain during early warmup are reseeded from surviving chains.
     """
     dim_parameters = prior.dim
     if init_strategy is None:
         init_strategy = "jitter" if default_init_theta is not None else "sir_argmax"
-    if init_strategy not in ("jitter", "sir_argmax", "sir_resample", "prior"):
+    if init_strategy not in ("jitter", "sir_argmax", "sir_resample", "sir_pool", "prior"):
         raise ValueError(f"Unsupported init_strategy: {init_strategy}")
     if init_strategy == "jitter" and default_init_theta is None:
         raise ValueError("init_strategy='jitter' requires default_init_theta.")
@@ -318,6 +323,7 @@ def build_mh_mcmc_sampler(
         if default_init_theta is None
         else jnp.asarray(default_init_theta, dtype=jnp.float32)
     )
+    eye_d = jnp.eye(dim_parameters, dtype=jnp.float32)
 
     def log_joint(state_val, x_obs):
         lp_prior = prior.jax_log_prob_unconstrained(state_val)
@@ -336,6 +342,7 @@ def build_mh_mcmc_sampler(
             "burn_in",
             "inner_thin",
             "n_sir",
+            "adapt_warmup",
         ],
     )
     def run_mcmc(
@@ -347,12 +354,36 @@ def build_mh_mcmc_sampler(
         inner_thin: int = 4,
         step_size: float = 0.05,
         n_sir: int = 100,
+        adapt_warmup: bool = True,
     ):
-        k_init, k_mcmc = jax.random.split(rng_key)
+        k_init, k_warm, k_samp = jax.random.split(rng_key, 3)
 
         if init_strategy == "prior":
             curr_thetas = prior.jax_sample_unconstrained(k_init, n_chains)
             curr_lp = v_log_joint(curr_thetas, x_obs)
+        elif init_strategy == "sir_pool":
+            pool_size = max(n_sir, n_chains)
+            chunk_size = min(256, pool_size)
+            n_chunks = (pool_size + chunk_size - 1) // chunk_size
+            padded_size = n_chunks * chunk_size
+            cands_all = prior.jax_sample_unconstrained(k_init, padded_size)
+            cands_chunks = cands_all.reshape(n_chunks, chunk_size, dim_parameters)
+            _, lps_chunks = jax.lax.scan(
+                lambda _, batch: (None, v_log_joint(batch, x_obs)),
+                None,
+                cands_chunks,
+            )
+            cands = cands_all[:pool_size]
+            lps = lps_chunks.reshape(padded_size)[:pool_size]
+            if init_arr is not None:
+                canon_u = prior.clip_unconstrained(prior.to_unconstrained(init_arr))
+                canon_lp = log_joint(canon_u, x_obs)
+                cands = jnp.concatenate([cands, canon_u[None, :]], axis=0)
+                lps = jnp.concatenate([lps, canon_lp[None]], axis=0)
+            safe_lps = jnp.where(jnp.isfinite(lps), lps, -jnp.inf)
+            top_idx = jnp.argsort(safe_lps)[-n_chains:]
+            curr_thetas = cands[top_idx]
+            curr_lp = lps[top_idx]
         else:
 
             def init_single_chain(k):
@@ -388,27 +419,172 @@ def build_mh_mcmc_sampler(
             init_keys = jax.random.split(k_init, n_chains)
             curr_thetas, curr_lp = jax.vmap(init_single_chain)(init_keys)
 
-        def scan_step(state, subkey):
+        def mh_block(th, lp, log_scale, chol, subkey):
             keys_th = jax.random.split(subkey, inner_thin)
+            scale = jnp.exp(log_scale)[:, None]
 
             def theta_step(carry, subkey_th):
-                th, lp = carry
+                t_c, lp_c, acc_sum = carry
                 k_p, k_a = jax.random.split(subkey_th)
-                prop_th = th + jax.random.normal(k_p, shape=th.shape) * step_size
+                z = jax.random.normal(k_p, shape=t_c.shape)
+                step = scale * jnp.einsum("cij,cj->ci", chol, z)
+                prop_th = t_c + step
                 prop_lp = v_log_joint(prop_th, x_obs)
                 log_u = jnp.log(jax.random.uniform(k_a, shape=(n_chains,)))
-                acc = jnp.isfinite(prop_lp) & (log_u < prop_lp - lp)
-                new_th = jnp.where(acc[:, None], prop_th, th)
-                new_lp = jnp.where(acc, prop_lp, lp)
+                acc = jnp.isfinite(prop_lp) & (log_u < prop_lp - lp_c)
+                new_th = jnp.where(acc[:, None], prop_th, t_c)
+                new_lp = jnp.where(acc, prop_lp, lp_c)
+                return (new_th, new_lp, acc_sum + acc.astype(jnp.float32)), None
+
+            (new_th, new_lp, acc_sum), _ = jax.lax.scan(
+                theta_step,
+                (th, lp, jnp.zeros((n_chains,), dtype=jnp.float32)),
+                keys_th,
+            )
+            return new_th, new_lp, acc_sum / float(inner_thin)
+
+        init_log_scale = jnp.full(
+            (n_chains,),
+            jnp.log(jnp.maximum(jnp.asarray(step_size, dtype=jnp.float32), 1e-5)),
+            dtype=jnp.float32,
+        )
+        curr_ls = init_log_scale
+        curr_chol = jnp.broadcast_to(eye_d, (n_chains, dim_parameters, dim_parameters))
+
+        if burn_in > 0 and adapt_warmup:
+            target_acc = 0.234 if dim_parameters > 1 else 0.44
+            phase1 = burn_in // 3
+            phase2 = (2 * burn_in) // 3
+            use_cov_adapt = (phase2 - phase1) >= max(20, 4 * dim_parameters)
+            do_rescue_enabled = rescue_stuck_chains and (burn_in >= 30)
+            min_ls = jnp.log(1e-5)
+            max_ls = jnp.log(10.0)
+            opt_ls = jnp.log(2.38 / jnp.sqrt(float(dim_parameters)))
+
+            def warmup_step(carry, inputs):
+                th, lp, ls, chol, mu, m2, cnt = carry
+                step_idx, subkey = inputs
+                k_mh, k_res = jax.random.split(subkey)
+
+                th, lp, acc_rate = mh_block(th, lp, ls, chol, k_mh)
+                gamma = (step_idx.astype(jnp.float32) + 10.0) ** (-0.6)
+                ls = jnp.clip(ls + gamma * (acc_rate - target_acc), min_ls, max_ls)
+
+                if do_rescue_enabled:
+                    do_rescue = (step_idx == (phase1 // 2)) | (step_idx == phase1)
+
+                    def rescue_fn(args):
+                        t_r, lp_r, ls_r, kr = args
+                        safe_lp = jnp.where(jnp.isfinite(lp_r), lp_r, -jnp.inf)
+                        max_lp = jnp.max(safe_lp)
+                        has_finite = jnp.isfinite(max_lp)
+                        good = has_finite & (safe_lp >= (max_lp - 25.0))
+                        w = jnp.where(
+                            good, jnp.exp(jnp.clip(safe_lp - max_lp, -50.0, 0.0)), 0.0
+                        )
+                        w_sum = jnp.sum(w)
+                        probs = jnp.where(
+                            w_sum > 0.0, w / w_sum, jnp.ones(n_chains) / n_chains
+                        )
+                        k1, k2 = jax.random.split(kr)
+                        idx = jax.random.choice(k1, n_chains, shape=(n_chains,), p=probs)
+                        bad = has_finite & (~good)
+                        jitter = jax.random.normal(k2, shape=t_r.shape) * (
+                            0.1 * jnp.exp(ls_r[idx])[:, None]
+                        )
+                        cand_t = t_r[idx] + jitter
+                        cand_lp = v_log_joint(cand_t, x_obs)
+                        use_cand = bad & jnp.isfinite(cand_lp) & (cand_lp > safe_lp)
+                        return (
+                            jnp.where(use_cand[:, None], cand_t, t_r),
+                            jnp.where(use_cand, cand_lp, lp_r),
+                            jnp.where(use_cand, ls_r[idx], ls_r),
+                        )
+
+                    th, lp, ls = jax.lax.cond(
+                        do_rescue, rescue_fn, lambda a: a[:3], (th, lp, ls, k_res)
+                    )
+
+                if use_cov_adapt:
+                    in_cov = (step_idx > phase1) & (step_idx < phase2)
+
+                    def update_welford(args):
+                        t_w, mu_w, m2_w, cnt_w = args
+                        cnt_new = cnt_w + 1.0
+                        delta = t_w - mu_w
+                        mu_new = mu_w + delta / cnt_new
+                        delta2 = t_w - mu_new
+                        m2_new = m2_w + jnp.einsum("ci,cj->cij", delta, delta2)
+                        return mu_new, m2_new, cnt_new
+
+                    mu, m2, cnt = jax.lax.cond(
+                        step_idx == phase1,
+                        lambda a: (
+                            a[0],
+                            jnp.zeros_like(a[2]),
+                            jnp.ones((), dtype=jnp.float32),
+                        ),
+                        lambda a: jax.lax.cond(in_cov, update_welford, lambda b: b[1:], a),
+                        (th, mu, m2, cnt),
+                    )
+
+                    def compute_chol(args):
+                        m2_c, cnt_c, chol_prev, ls_prev = args
+                        cov_c = m2_c / jnp.maximum(cnt_c - 1.0, 1.0)
+                        diag_mean = jnp.mean(
+                            jnp.diagonal(cov_c, axis1=-2, axis2=-1), axis=-1
+                        )
+                        reg = (1e-3 * jnp.maximum(diag_mean, 1e-6) + 1e-6)[
+                            :, None, None
+                        ]
+                        cov_sym = 0.5 * (cov_c + jnp.swapaxes(cov_c, -1, -2))
+                        cov_reg = cov_sym + reg * eye_d[None, :, :]
+                        L_cand = jnp.linalg.cholesky(cov_reg)
+                        valid = (diag_mean > 1e-10) & jnp.all(
+                            jnp.isfinite(L_cand), axis=(-2, -1)
+                        )
+                        L_out = jnp.where(valid[:, None, None], L_cand, chol_prev)
+                        ls_out = jnp.where(valid, opt_ls, ls_prev)
+                        return L_out, ls_out
+
+                    chol, ls = jax.lax.cond(
+                        step_idx == phase2,
+                        compute_chol,
+                        lambda a: (a[2], a[3]),
+                        (m2, cnt, chol, ls),
+                    )
+
+                return (th, lp, ls, chol, mu, m2, cnt), None
+
+            warm_keys = jax.random.split(k_warm, burn_in)
+            init_m2 = jnp.zeros((n_chains, dim_parameters, dim_parameters), dtype=jnp.float32)
+            init_cnt = jnp.zeros((), dtype=jnp.float32)
+            (curr_thetas, curr_lp, curr_ls, curr_chol, _, _, _), _ = jax.lax.scan(
+                warmup_step,
+                (curr_thetas, curr_lp, curr_ls, curr_chol, curr_thetas, init_m2, init_cnt),
+                (jnp.arange(burn_in), warm_keys),
+            )
+        elif burn_in > 0:
+            warm_keys = jax.random.split(k_warm, burn_in)
+
+            def fixed_warm_step(state, subkey):
+                th, lp = state
+                new_th, new_lp, _ = mh_block(th, lp, curr_ls, curr_chol, subkey)
                 return (new_th, new_lp), None
 
-            (curr_thetas, curr_lp), _ = jax.lax.scan(theta_step, state, keys_th)
-            return (curr_thetas, curr_lp), curr_thetas
+            (curr_thetas, curr_lp), _ = jax.lax.scan(
+                fixed_warm_step, (curr_thetas, curr_lp), warm_keys
+            )
 
-        total_steps = burn_in + num_samples_per_chain
-        keys = jax.random.split(k_mcmc, total_steps)
-        _, all_samples = jax.lax.scan(scan_step, (curr_thetas, curr_lp), keys)
-        post_burnin = prior.from_unconstrained(all_samples[burn_in:])
+        # Frozen sampling phase (exact detailed balance per chain)
+        def sample_step(state, subkey):
+            th, lp = state
+            new_th, new_lp, _ = mh_block(th, lp, curr_ls, curr_chol, subkey)
+            return (new_th, new_lp), new_th
+
+        samp_keys = jax.random.split(k_samp, num_samples_per_chain)
+        _, all_samples = jax.lax.scan(sample_step, (curr_thetas, curr_lp), samp_keys)
+        post_burnin = prior.from_unconstrained(all_samples)
         return post_burnin.transpose(1, 0, 2).reshape(-1, dim_parameters)
 
     return run_mcmc
