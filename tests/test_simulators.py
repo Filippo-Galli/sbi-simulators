@@ -34,6 +34,7 @@ from sbi_simulator import (
     extract_two_step_pairs,
 )
 from sbi_simulator.LinearSDE.simulator import matrix_fraction_decomposition
+from sbi_simulator.mcmc import build_mh_mcmc_sampler
 
 EXPECTED_SIMULATORS = [
     "AR1",
@@ -1151,3 +1152,120 @@ def test_custom_pyro_prior_syncs_with_jax_mcmc():
     )
     assert samples_lv.shape == (20, 4)
     assert torch.isfinite(samples_lv).all()
+
+
+def test_ode_mcmc_custom_x_obs_convergence():
+    """Verify ODE MCMC converges and mixes well on non-canonical prior-drawn x_obs."""
+    cases = [
+        (LotkaVolterra(preset="sbibm", seed=10), 2),
+        (SIR(preset="sbibm", seed=11), 2),
+        (LotkaVolterra(preset="papamakarios", seed=12), 1),
+    ]
+    for sim, n_draws in cases:
+        torch.manual_seed(7)
+        thetas_true = sim.sample_prior(n_draws)
+        for th_true in thetas_true:
+            x_obs = sim.simulate(th_true)
+            lp_true = float(
+                sim.log_likelihood(th_true, x_obs).item()
+                + sim.get_prior().log_prob(th_true).item()
+            )
+            samples = sim.posterior_samples(x_obs, num_samples=2000)
+            assert samples.shape == (2000, sim.dim_parameters)
+            assert torch.isfinite(samples).all()
+
+            # High unique sample fraction confirms adaptive warmup avoids stuck steps
+            unique_ratio = torch.unique(samples, dim=0).shape[0] / samples.shape[0]
+            assert unique_ratio > 0.75, f"Low unique ratio {unique_ratio:.3f} on {sim}"
+
+            # Evaluate posterior log-joint on a subsample: 10th percentile must be near mode
+            sub = samples[:400]
+            sub_lp = sim.log_likelihood(sub, x_obs) + sim.get_prior().log_prob(sub)
+            assert torch.isfinite(sub_lp).all()
+            q10_lp = float(torch.quantile(sub_lp, 0.10).item())
+            assert q10_lp > lp_true - 25.0, (
+                f"Stuck chains detected on {sim}: q10_lp={q10_lp:.2f}, lp_true={lp_true:.2f}"
+            )
+
+
+def test_ode_mcmc_self_consistency():
+    """Verify two independent ODE MCMC runs agree closely on canonical and custom x_obs."""
+    for sim_cls in (LotkaVolterra, SIR):
+        sim_a = sim_cls(preset="sbibm", seed=101)
+        sim_b = sim_cls(preset="sbibm", seed=202)
+        torch.manual_seed(13)
+        custom_theta = sim_a.sample_prior(1)[0]
+        for th in (sim_a.canonical_theta, custom_theta):
+            x_obs = sim_a.simulate(th)
+            s1 = sim_a.posterior_samples(x_obs, num_samples=3000)
+            s2 = sim_b.posterior_samples(x_obs, num_samples=3000)
+            mean_diff = (s1.mean(dim=0) - s2.mean(dim=0)).abs() / (s1.std(dim=0) + 1e-8)
+            std_ratio = s1.std(dim=0) / (s2.std(dim=0) + 1e-8)
+            assert float(mean_diff.max().item()) < 0.15
+            assert (std_ratio > 0.80).all() and (std_ratio < 1.25).all()
+
+
+def test_mh_mcmc_adapt_warmup_edge_cases():
+    """Verify sir_pool, adaptive warmup edge cases, and multimodal SLCP coverage."""
+    # Strongly correlated 2D Gaussian target: N(mu, Sigma) with rho=0.95
+    mu_target = jnp.array([2.5, -1.8], dtype=jnp.float32)
+    cov_target = jnp.array([[0.04, 0.038], [0.038, 0.04]], dtype=jnp.float32)
+    inv_cov = jnp.linalg.inv(cov_target)
+    prior = NormalPrior.isotropic(2)
+
+    # Cancel prior in likelihood so exact posterior is N(mu_target, cov_target)
+    def ll_fn(theta, _x_obs):
+        diff = theta - mu_target
+        target_lp = -0.5 * jnp.dot(diff, inv_cov @ diff)
+        return target_lp - prior.jax_log_prob(theta)
+
+    sampler = build_mh_mcmc_sampler(
+        ll_fn,
+        prior=prior,
+        default_init_theta=(0.0, 0.0),
+        init_strategy="sir_pool",
+        rescue_stuck_chains=True,
+    )
+    dummy_obs = jnp.zeros(1, dtype=jnp.float32)
+
+    # Edge case: n_sir < n_chains with full 3-phase adaptive warmup
+    samples = sampler(
+        dummy_obs,
+        jax.random.PRNGKey(0),
+        n_chains=16,
+        num_samples_per_chain=200,
+        burn_in=240,
+        inner_thin=4,
+        step_size=0.5,
+        n_sir=4,
+        adapt_warmup=True,
+    )
+    assert samples.shape == (3200, 2)
+    assert jnp.isfinite(samples).all()
+    assert jnp.allclose(jnp.mean(samples, axis=0), mu_target, atol=0.05)
+    assert jnp.allclose(jnp.cov(samples.T), cov_target, atol=0.015)
+
+    # Edge cases: burn_in=0, small burn_in=10 (below cov threshold), adapt_warmup=False
+    for burn_in, adapt in [(0, True), (10, True), (20, False)]:
+        out = sampler(
+            dummy_obs,
+            jax.random.PRNGKey(1),
+            n_chains=4,
+            num_samples_per_chain=10,
+            burn_in=burn_in,
+            inner_thin=2,
+            step_size=0.1,
+            n_sir=16,
+            adapt_warmup=adapt,
+        )
+        assert out.shape == (40, 2)
+        assert jnp.isfinite(out).all()
+
+    # Multimodal preservation on SLCP under adaptive per-chain warmup
+    slcp = SLCP(seed=42)
+    slcp_samples = slcp.posterior_samples(num_samples=2000)
+    assert slcp_samples.shape == (2000, 5)
+    assert torch.isfinite(slcp_samples).all()
+    assert (slcp_samples[:, 2] > 0.2).any() and (slcp_samples[:, 2] < -0.2).any()
+    assert (slcp_samples[:, 3] > 0.2).any() and (slcp_samples[:, 3] < -0.2).any()
+    assert torch.unique(slcp_samples, dim=0).shape[0] / slcp_samples.shape[0] > 0.50
