@@ -14,8 +14,8 @@ from ..base import Simulator
 from ..compositional import sample_two_step
 from ..mcmc import (
     build_gibbs_pmmh_sampler,
+    build_mh_mcmc_sampler,
     build_ode_ll,
-    build_ode_mcmc_sampler,
     build_particle_filter_ll,
 )
 
@@ -430,18 +430,11 @@ class LotkaVolterra(Simulator):
 
         if self.preset == "sbibm":
             prior_type = "lognormal"
-            prior_loc_jax = jnp.asarray(self.prior_loc, dtype=jnp.float32)
-            prior_scale_jax = jnp.asarray(self.prior_scale, dtype=jnp.float32)
         elif self.preset == "papamakarios":
             prior_type = "uniform"
-            prior_loc_jax = None
-            prior_scale_jax = None
         else:
             prior_type = "gaussian"
-            prior_loc_jax = None
-            prior_scale_jax = None
 
-        cand_th = jnp.asarray(self.canonical_theta.numpy())
         base_u0_jax = jnp.asarray(self.u0.detach().cpu().numpy())
 
         if self.mode == "ode":
@@ -457,7 +450,6 @@ class LotkaVolterra(Simulator):
             self._ode_ll_fn = build_ode_ll(
                 self._jax_solver_single,
                 obs_dim=2,
-                num_steps=self.num_steps,
                 obs_sigma=self.obs_sigma,
             )
             if self.summary in ("stats", "summary_stats"):
@@ -466,15 +458,15 @@ class LotkaVolterra(Simulator):
                 active_ll_fn = self._lognormal_ll_fn
             else:
                 active_ll_fn = self._ode_ll_fn
-            self._jax_mcmc = build_ode_mcmc_sampler(
+            self._jax_mcmc = build_mh_mcmc_sampler(
                 active_ll_fn,
                 dim_parameters=self.dim_parameters,
                 prior_type=prior_type,
                 prior_low=-5.0,
                 prior_high=2.0,
-                prior_loc=prior_loc_jax,
-                prior_scale=prior_scale_jax,
-                default_init_theta=cand_th,
+                prior_loc=tuple(self.prior_loc) if self.preset == "sbibm" else None,
+                prior_scale=tuple(self.prior_scale) if self.preset == "sbibm" else None,
+                default_init_theta=tuple(float(v) for v in self.canonical_theta.tolist()),
             )
         else:
             self._pf_ll_fn = build_particle_filter_ll(

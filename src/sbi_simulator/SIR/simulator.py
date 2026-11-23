@@ -14,8 +14,8 @@ from ..base import Simulator
 from ..compositional import sample_two_step
 from ..mcmc import (
     build_gibbs_pmmh_sampler,
+    build_mh_mcmc_sampler,
     build_ode_ll,
-    build_ode_mcmc_sampler,
     build_particle_filter_ll,
 )
 
@@ -348,16 +348,7 @@ class SIR(Simulator):
             default_x0=base_u0_jax,
         )
 
-        if self.preset == "sbibm":
-            prior_type = "lognormal"
-            prior_loc_jax = jnp.asarray(self.prior_loc, dtype=jnp.float32)
-            prior_scale_jax = jnp.asarray(self.prior_scale, dtype=jnp.float32)
-        else:
-            prior_type = "gaussian"
-            prior_loc_jax = None
-            prior_scale_jax = None
-
-        cand_th = jnp.asarray(self.canonical_theta.numpy())
+        prior_type = "lognormal" if self.preset == "sbibm" else "gaussian"
 
         if self.mode == "ode":
             self._binomial_ll_fn = _build_sir_binomial_ll(
@@ -369,7 +360,6 @@ class SIR(Simulator):
             self._ode_ll_fn = build_ode_ll(
                 self._jax_solver_single,
                 obs_dim=3,
-                num_steps=self.num_steps,
                 obs_sigma=self.obs_sigma,
             )
             active_ll_fn = (
@@ -377,13 +367,13 @@ class SIR(Simulator):
                 if self.summary == "binomial"
                 else self._ode_ll_fn
             )
-            self._jax_mcmc = build_ode_mcmc_sampler(
+            self._jax_mcmc = build_mh_mcmc_sampler(
                 active_ll_fn,
                 dim_parameters=self.dim_parameters,
                 prior_type=prior_type,
-                prior_loc=prior_loc_jax,
-                prior_scale=prior_scale_jax,
-                default_init_theta=cand_th,
+                prior_loc=tuple(self.prior_loc) if self.preset == "sbibm" else None,
+                prior_scale=tuple(self.prior_scale) if self.preset == "sbibm" else None,
+                default_init_theta=tuple(float(v) for v in self.canonical_theta.tolist()),
             )
         else:
             self._pf_ll_fn = build_particle_filter_ll(
