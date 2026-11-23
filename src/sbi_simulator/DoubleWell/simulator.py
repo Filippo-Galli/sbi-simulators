@@ -1,5 +1,6 @@
 """Simulator for the Double-Well SDE model."""
 
+import functools
 import math
 from typing import override
 
@@ -9,9 +10,14 @@ import numpy as np
 import pyro.distributions as pdist
 import torch
 
-from ..base import Simulator
-from ..compositional import sample_two_step
-from ..mcmc import build_gibbs_pmmh_sampler, build_particle_filter_ll
+from ..dynamical import DynamicalSimulator
+from ..mcmc import (
+    build_batched_ll,
+    build_gibbs_pmmh_sampler,
+    build_jax_trajectory_solver,
+    build_particle_filter_ll,
+)
+from ..summary_stats import trajectory_stats_interleaved
 
 
 def _build_double_well_step_fn(
@@ -26,13 +32,12 @@ def _build_double_well_step_fn(
 
     def integrate_step(x, key, theta1, theta2):
         xdt = drift(x, theta1, theta2)
-        dWt = jax.random.normal(key, shape=(dim,)) * jnp.sqrt(dt)
-        return x + xdt * dt + dWt
+        d_wt = jax.random.normal(key, shape=(dim,)) * jnp.sqrt(dt)
+        return x + xdt * dt + d_wt
 
     def step_one(x, key, theta):
         theta1 = jnp.exp(0.5 * theta[0])
         theta2 = -jnp.exp(0.5 * theta[1])
-
         keys = jax.random.split(key, inner_steps)
 
         def inner_loop(i, curr_x):
@@ -43,33 +48,33 @@ def _build_double_well_step_fn(
     return step_one
 
 
-def _build_double_well_sde_jax_solver(step_one_fn, num_steps: int = 11, dim: int = 4):
-    """Build a JIT-compiled batched Euler-Maruyama SDE solver in JAX for Double-Well."""
-    default_x0 = jnp.array([-0.5, 0.5] * (dim // 2), dtype=jnp.float32)
-
-    def solve_single(rng_key, theta, x0=None):
-        u0 = default_x0 if x0 is None else x0
-
-        def one_step(x, key):
-            x_next = step_one_fn(x, key, theta)
-            return x_next, x_next
-
-        keys = jax.random.split(rng_key, num_steps - 1)
-        _, xs = jax.lax.scan(one_step, u0, keys)
-        full_traj = jnp.concatenate([u0[None, :], xs], axis=0)  # (num_steps, dim)
-        return full_traj.T  # (dim, num_steps)
-
-    solve_batch_fn = jax.vmap(solve_single, in_axes=(0, 0, 0))
-
-    def solve_batch(rng_keys, thetas, x0s=None):
-        if x0s is None:
-            x0s = jnp.broadcast_to(default_x0, (thetas.shape[0], dim))
-        return solve_batch_fn(rng_keys, thetas, x0s)
-
-    return jax.jit(solve_batch), jax.jit(solve_single)
+def _default_double_well_u0(dim: int) -> tuple[float, ...]:
+    return tuple(([-0.5, 0.5] * ((dim + 1) // 2))[:dim])
 
 
-class DoubleWell(Simulator):
+@functools.lru_cache(maxsize=32)
+def _get_double_well_jax_bundle(
+    dt: float,
+    inner_steps: int,
+    dim: int,
+    num_steps: int,
+    obs_sigma: float,
+):
+    """Build and cache compiled JAX solver, particle filter, and Gibbs PMMH sampler."""
+    step_fn = _build_double_well_step_fn(dt=dt, inner_steps=inner_steps, dim=dim)
+    solve_batch, _ = build_jax_trajectory_solver(
+        step_fn,
+        num_steps=num_steps,
+        default_x0=_default_double_well_u0(dim),
+        clip_non_negative=False,
+    )
+    pf_ll_fn = build_particle_filter_ll(step_fn, obs_dim=dim, obs_sigma=obs_sigma)
+    v_pf_ll_fn = build_batched_ll(pf_ll_fn, stochastic=True)
+    jax_mcmc = build_gibbs_pmmh_sampler(pf_ll_fn, dim_parameters=2)
+    return solve_batch, v_pf_ll_fn, jax_mcmc
+
+
+class DoubleWell(DynamicalSimulator):
     r"""Double-Well Potential Stochastic Differential Equation (SDE) Simulator.
 
     Mathematical Model:
@@ -82,43 +87,17 @@ class DoubleWell(Simulator):
            $$\tilde{\theta} = [\tilde{\theta}_0, \tilde{\theta}_1]^T \sim \mathcal{N}(0, I_2)$$
 
     2. Parameter Transformation:
-       The latent parameters map to positive potential parameters via an exponential transformation:
-           $$\theta_1 = \exp(0.5 \cdot \tilde{\theta}_0) > 0 \quad \text{(linear anti-damping)}$$
-           $$\theta_2 = -\exp(0.5 \cdot \tilde{\theta}_1) < 0 \quad \text{(cubic restoring force)}$$
-       These parameters define the bistable potential $V(x) = -\frac{\theta_1}{2} x^2 - \frac{\theta_2}{4} x^4$,
-       which possesses two stable potential wells at $x^* = \pm \sqrt{-\theta_1 / \theta_2}$.
+       $$\theta_1 = \exp(0.5 \cdot \tilde{\theta}_0) > 0, \qquad \theta_2 = -\exp(0.5 \cdot \tilde{\theta}_1) < 0$$
+       defining the bistable potential $V(x) = -\frac{\theta_1}{2} x^2 - \frac{\theta_2}{4} x^4$.
 
     3. Continuous Dynamics:
-       Stochastic differential equation governing each state coordinate:
-           $$dx_t = (\theta_1 x_t + \theta_2 x_t^3) \, dt + dW_t$$
-       where $W_t$ is standard $D$-dimensional Brownian motion.
+       $$dx_t = (\theta_1 x_t + \theta_2 x_t^3) \, dt + dW_t$$
 
-    4. Initial Condition:
-       Default alternating initial state $u_0 = [-0.5, 0.5, \dots, -0.5, 0.5]^T \in \mathbb{R}^D$.
-
-    5. Numerical Integration & Observation Model:
-       Integrated using Euler-Maruyama discretization with step size $dt = 0.005$
-       and `inner_steps` = 10 sub-steps per observation interval:
-           $$\Delta t_{\text{obs}} = dt \times \text{inner\_steps} = 0.05$$
-       Over $T = \text{num\_steps} = 11$, total simulated duration is $t \in [0, 0.50]$.
-       Additive Gaussian observation noise with standard deviation $\sigma_{\text{obs}} = 0.05$:
-           $$y_t \sim \mathcal{N}(x_t, \sigma_{\text{obs}}^2 I_D), \quad t = 0, \dots, T-1$$
-
-    6. Summary Modes:
-       - `None`: Raw trajectory of shape $(D \times \text{num\_steps},) = (44,)$.
-       - `"subsample"`: Trajectory with additive Gaussian observation noise $\sigma_{\text{obs}}$, shape $(44,)$.
-       - `"stats"`: 16 summary statistics (4 stats for each of the $D=4$ coordinates).
-       - `"two_step"`: Transition pairs $(x_t, x_{t+1})$ of shape $(2D,) = (8,)$ for Markov SBI.
-
-    Posterior Distribution & Reference Sampling:
-    ---------------------------------------------
-    The posterior distribution is conditioned on the full trajectory observations $y_{1:T}$:
-        $$p(\tilde{\theta} \mid y_{1:T}) \propto p(\tilde{\theta}) \, p(y_{1:T} \mid \tilde{\theta})$$
-
-    - The marginal likelihood $p(y_{1:T} \mid \tilde{\theta}) = \int p(y_{1:T}, x_{1:T} \mid \tilde{\theta}) \, dx_{1:T}$
-      is estimated unbiasedly via a bootstrap Sequential Monte Carlo (SMC) Particle Filter ($N=150$ particles).
-    - Sampled via JAX-accelerated Gibbs Particle Marginal Metropolis-Hastings (PMMH).
-    - Returned posterior samples are in the unconstrained latent parameter space $\tilde{\theta} \in \mathbb{R}^2$.
+    4. Summary Modes:
+       - `None`: Raw trajectory of shape $(D \times \text{num\_steps},)$.
+       - `"subsample"`: Trajectory with additive Gaussian observation noise $\sigma_{\text{obs}}$.
+       - `"stats"` / `"summary_stats"`: $4D$ summary statistics (mean, log-var, ac1, ac2 per dim).
+       - `"two_step"`: Transition pairs $(x_t, x_{t+1})$ of shape $(2D,)$ for Markov SBI.
     """
 
     def __init__(
@@ -133,142 +112,64 @@ class DoubleWell(Simulator):
         summary: str | None = None,
         **kwargs,
     ):
-        self.dim_parameters = dim_parameters
         if dim_parameters != 2:
             raise ValueError(
                 f"DoubleWell requires dim_parameters=2, got {dim_parameters}."
             )
+        if D < 1:
+            raise ValueError(f"DoubleWell requires D >= 1, got {D}.")
 
         self.D = D
-        self.dt = dt
-        self.inner_steps = inner_steps
-        self.num_steps = num_steps
-        self.obs_sigma = obs_sigma
-        self.dim_data_raw = int(D * num_steps)
+        self.dt = float(dt)
+        self.inner_steps = int(inner_steps)
 
-        if summary is None or summary == "subsample":
-            self.dim_data = self.dim_data_raw
-        elif summary in ("stats", "summary_stats"):
-            # 4 summary statistics per dimension: mean, log-var, ac1, ac2
-            self.dim_data = 4 * D
-        elif summary == "two_step":
-            self.dim_data = 2 * D
-        else:
-            raise NotImplementedError(f"Unknown summary mode: {summary}")
-        self.summary = summary
+        u0 = torch.tensor(_default_double_well_u0(D), dtype=torch.float32)
+        dim_data = self._resolve_summary_dim(
+            summary,
+            dim_raw=int(D * num_steps),
+            dim_stats=4 * D,
+            dim_two_step=2 * D,
+        )
 
-        super().__init__(seed, self.dim_parameters, self.dim_data, **kwargs)
+        super().__init__(
+            seed=seed,
+            dim_parameters=dim_parameters,
+            dim_data=dim_data,
+            state_dim=D,
+            num_steps=num_steps,
+            obs_sigma=obs_sigma,
+            summary=summary,
+            u0=u0,
+            **kwargs,
+        )
 
-        self.u0 = torch.tensor([-0.5, 0.5] * (D // 2), dtype=torch.float32)
-
-        # Prior setup: Standard Normal N(0, I_2)
-        self.prior_loc = [0.0] * dim_parameters
-        self.prior_scale = [1.0] * dim_parameters
         self.prior_dist = pdist.Normal(
             loc=torch.zeros(dim_parameters, dtype=torch.float32),
             scale=torch.ones(dim_parameters, dtype=torch.float32),
         ).to_event(1)
 
-        # Build JAX SDE solver and Particle Filter MCMC sampler
-        self._step_fn = _build_double_well_step_fn(
-            dt=self.dt,
-            inner_steps=self.inner_steps,
-            dim=self.D,
-        )
-        self._jax_solver_batch, self._jax_solver_single = (
-            _build_double_well_sde_jax_solver(
-                self._step_fn,
-                num_steps=self.num_steps,
-                dim=self.D,
+        self._jax_solver_batch, self._v_pf_ll_fn, self._jax_mcmc = (
+            _get_double_well_jax_bundle(
+                self.dt,
+                self.inner_steps,
+                self.D,
+                self.num_steps,
+                self.obs_sigma,
             )
         )
-        self._pf_ll_fn = build_particle_filter_ll(
-            self._step_fn,
-            obs_dim=self.D,
-            obs_sigma=self.obs_sigma,
-        )
-        self._jax_mcmc = build_gibbs_pmmh_sampler(
-            self._pf_ll_fn,
-            dim_parameters=self.dim_parameters,
-        )
-
-    def _solve(
-        self,
-        parameters: torch.Tensor,
-        u0: torch.Tensor | None = None,
-        rng_key: jax.Array | None = None,
-    ) -> torch.Tensor:
-        """Batched SDE Euler-Maruyama simulation accelerated via JAX.
-
-        parameters: (num_samples, 2) tensor of raw thetas
-        u0: optional (num_samples, D) tensor of initial states
-        returns: (num_samples, D, num_steps) tensor
-        """
-        params_np = parameters.detach().cpu().numpy().astype(np.float32)
-        params_jax = jnp.asarray(params_np)
-        batch_size = params_jax.shape[0]
-
-        if rng_key is None:
-            rng_key = jax.random.PRNGKey(self.seed)
-        keys = jax.random.split(rng_key, batch_size)
-
-        if u0 is not None:
-            u0_np = u0.detach().cpu().numpy().astype(np.float32)
-            u0_jax = jnp.asarray(u0_np)
-            res_jax = self._jax_solver_batch(keys, params_jax, u0_jax)
-        else:
-            res_jax = self._jax_solver_batch(keys, params_jax)
-
-        res_np = np.array(res_jax, copy=True)
-        return torch.from_numpy(res_np)
 
     def get_prior_x0(self) -> pdist.Distribution:
-        """Prior over initial condition x0 in R^D."""
+        """Prior over initial condition ``x0`` in ``R^D``."""
         return pdist.Uniform(
             low=torch.full((self.D,), -2.5, dtype=torch.float32),
             high=torch.full((self.D,), 2.5, dtype=torch.float32),
         ).to_event(1)
 
     @staticmethod
+    @override
     def compute_summary_stats(us: torch.Tensor) -> torch.Tensor:
-        """Compute 4*D summary statistics from (num_samples, D, T) trajectory tensor.
-
-        Statistics per dimension d:
-            - Mean
-            - Log-variance
-            - Lag-1 autocorrelation
-            - Lag-2 autocorrelation
-        """
-        is_2d_traj = us.ndim == 2
-        if is_2d_traj:
-            us = us.unsqueeze(0)
-
-        eps = 1e-6
-        num_samples, _, t_steps = us.shape
-
-        means = us.mean(dim=-1, keepdim=True)  # (N, D, 1)
-        dus = us - means
-        vars_ = (dus**2).mean(dim=-1, keepdim=True)  # (N, D, 1)
-        log_vars = torch.log(vars_.clamp_min(eps))
-        denom = vars_.clamp_min(eps)
-
-        if t_steps >= 2:
-            ac1 = (dus[:, :, 1:] * dus[:, :, :-1]).mean(dim=-1, keepdim=True) / denom
-        else:
-            ac1 = torch.zeros_like(means)
-
-        if t_steps >= 3:
-            ac2 = (dus[:, :, 2:] * dus[:, :, :-2]).mean(dim=-1, keepdim=True) / denom
-        else:
-            ac2 = torch.zeros_like(means)
-
-        ac1 = torch.nan_to_num(ac1.clamp(-1.0, 1.0), nan=0.0)
-        ac2 = torch.nan_to_num(ac2.clamp(-1.0, 1.0), nan=0.0)
-
-        # Shape: (N, 4, D) -> transpose & flatten to (N, 4*D)
-        stats = torch.cat([means, log_vars, ac1, ac2], dim=-1)  # (N, D, 4)
-        stats = stats.reshape(num_samples, -1)
-        return stats.squeeze(0) if is_2d_traj else stats
+        """Compute ``4 * D`` summary statistics from ``(num_samples, D, T)`` trajectories."""
+        return trajectory_stats_interleaved(us)
 
     def stepper(
         self,
@@ -276,194 +177,41 @@ class DoubleWell(Simulator):
         parameters: torch.Tensor,
         dt: float | None = None,
     ) -> torch.Tensor:
-        """Simulate a single time-series step transition for Double-Well SDE.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Current state in R^D, shape (D,) or (batch_size, D).
-        parameters : torch.Tensor
-            Double-Well parameters (raw theta in R^2), shape (2,) or (batch_size, 2).
-        dt : float, optional
-            Step time interval (default: self.dt * self.inner_steps = 0.05).
-
-        Returns
-        -------
-        torch.Tensor
-            Next state in R^D of shape (D,) or (batch_size, D).
-        """
-        x_t = torch.as_tensor(x, dtype=torch.float32)
-        params = torch.as_tensor(parameters, dtype=torch.float32)
-
-        is_1d = x_t.ndim == 1
-        if is_1d:
-            x_t = x_t.unsqueeze(0)
-        if params.ndim == 1:
-            params = params.unsqueeze(0)
-        if params.shape[0] == 1 and x_t.shape[0] > 1:
-            params = params.expand(x_t.shape[0], -1)
-        elif x_t.shape[0] == 1 and params.shape[0] > 1:
-            x_t = x_t.expand(params.shape[0], -1)
+        """Simulate a single observation-step transition for the Double-Well SDE."""
+        x_t, params, is_1d = self._broadcast_stepper_inputs(x, parameters)
 
         theta1 = torch.exp(0.5 * params[:, 0:1])
         theta2 = -torch.exp(0.5 * params[:, 1:2])
 
         step_dt = float(self.dt * self.inner_steps if dt is None else dt)
-        sub_dt = float(self.dt)
-        n_substeps = max(round(step_dt / sub_dt), 1)
+        n_substeps = max(round(step_dt / self.dt), 1)
         actual_h = step_dt / n_substeps
+        sqrt_h = math.sqrt(actual_h)
 
         curr_x = x_t.clone()
-
         for _ in range(n_substeps):
             xdt = theta1 * curr_x + theta2 * (curr_x**3)
-            dW = torch.randn_like(curr_x) * math.sqrt(actual_h)
-            curr_x = curr_x + xdt * actual_h + dW
+            curr_x = curr_x + xdt * actual_h + torch.randn_like(curr_x) * sqrt_h
 
         return curr_x.squeeze(0) if is_1d else curr_x
-
-    def simulate_two_step(
-        self,
-        parameters: torch.Tensor,
-        x0: torch.Tensor | None = None,
-        t: int | torch.Tensor | None = None,
-        informed: bool = True,
-        return_dict: bool = False,
-    ) -> torch.Tensor | dict[str, torch.Tensor]:
-        """Generate two-step transition pairs (x_t, x_{t+1}) for compositional SBI."""
-        return sample_two_step(
-            self,
-            parameters=parameters,
-            x0=x0,
-            t=t,
-            informed=informed,
-            return_dict=return_dict,
-        )
-
-    @override
-    def simulate(self, parameters: torch.Tensor | np.ndarray) -> torch.Tensor:
-        """Simulate trajectories given parameter tensor."""
-        parameters = torch.as_tensor(parameters, dtype=torch.float32)
-
-        if parameters.numel() == 0:
-            raise ValueError("Expected at least one parameter.")
-
-        is_1d = parameters.ndim == 1
-        if is_1d:
-            parameters = parameters.unsqueeze(0)
-
-        num_samples = parameters.shape[0]
-
-        if self.summary == "two_step":
-            pairs = self.simulate_two_step(parameters, return_dict=False)
-            pairs_flat = pairs.reshape(num_samples, 2 * self.D)
-            return pairs_flat.squeeze(0) if is_1d else pairs_flat
-
-        us = self._solve(parameters)  # (num_samples, D, num_steps)
-        us = us.float()
-
-        has_nan = torch.isnan(us.reshape(num_samples, -1)).any(dim=1)
-        idx_contains_nan = torch.where(has_nan)[0]
-        idx_contains_no_nan = torch.where(~has_nan)[0]
-
-        if self.summary is None:
-            traj_flat = us.reshape(num_samples, -1)
-            return traj_flat.squeeze(0) if is_1d else traj_flat
-
-        if self.summary == "subsample":
-            data = torch.full(
-                (num_samples, self.dim_data),
-                float("nan"),
-                dtype=torch.float32,
-            )
-
-            if len(idx_contains_nan) == num_samples:
-                return data.squeeze(0) if is_1d else data
-
-            raw_data = us[idx_contains_no_nan, :, :].reshape(
-                len(idx_contains_no_nan), -1
-            )
-            noise = torch.randn_like(raw_data) * self.obs_sigma
-            sampled = raw_data + noise
-
-            data[idx_contains_no_nan, :] = sampled
-            return data.squeeze(0) if is_1d else data
-
-        if self.summary in ("stats", "summary_stats"):
-            data = torch.full(
-                (num_samples, self.dim_data),
-                float("nan"),
-                dtype=torch.float32,
-            )
-
-            if len(idx_contains_nan) == num_samples:
-                return data.squeeze(0) if is_1d else data
-
-            stats = self.compute_summary_stats(us[idx_contains_no_nan, :, :])
-            data[idx_contains_no_nan, :] = stats
-            return data.squeeze(0) if is_1d else data
-
-        raise ValueError(f"Unknown summary mode: {self.summary}")
 
     @override
     def get_prior(self) -> pdist.Distribution:
         return self.prior_dist
 
     def log_likelihood(
-        self, parameters: torch.Tensor, x_obs: torch.Tensor, n_particles: int = 150
+        self,
+        parameters: torch.Tensor | np.ndarray,
+        x_obs: torch.Tensor | np.ndarray,
+        n_particles: int = 150,
     ) -> torch.Tensor:
-        r"""Evaluate marginal log-likelihood $\log p(y_{1:T} \mid \tilde{\theta})$.
+        """Evaluate marginal log-likelihood ``log p(y_{1:T} | theta)`` via particle filter."""
+        params, _ = self._prepare_parameters(parameters)
+        x_jax = self._format_trajectory_obs(x_obs)
+        params_jax = jnp.asarray(params.detach().cpu().numpy(), dtype=jnp.float32)
 
-        Mathematical Formulation:
-        -------------------------
-        Marginal log-likelihood integrating out the latent Brownian diffusion path:
-            $$\log p(y_{1:T} \mid \tilde{\theta}) = \log \int p(y_{1:T}, x_{1:T} \mid \tilde{\theta}) \, dx_{1:T}$$
-        where $y_t \sim \mathcal{N}(x_t, \sigma_{\text{obs}}^2 I_D)$ with $\sigma_{\text{obs}} = 0.05$.
-        Estimated unbiasedly using a JAX-accelerated Sequential Monte Carlo (SMC) bootstrap
-        particle filter with $N = \text{n\_particles}$ particles and systematic resampling.
-
-        Parameters
-        ----------
-        parameters : torch.Tensor
-            Latent parameter tensor $\tilde{\theta} \in \mathbb{R}^2$, shape `(2,)` or `(batch_size, 2)`.
-        x_obs : torch.Tensor
-            Observed trajectory $y_{1:T}$, shape `(D * num_steps,)`, `(D, num_steps)`,
-            or `(num_steps, D)`.
-        n_particles : int, optional
-            Number of particles for the SMC particle filter (default: 150).
-
-        Returns
-        -------
-        torch.Tensor
-            Log-likelihood values of shape `(batch_size,)`.
-        """
-        parameters = torch.as_tensor(parameters, dtype=torch.float32)
-        if parameters.ndim == 1:
-            parameters = parameters.unsqueeze(0)
-
-        num_samples = parameters.shape[0]
-        if isinstance(x_obs, np.ndarray):
-            x_obs = torch.from_numpy(x_obs).float()
-        x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
-        if x_obs_tensor.ndim == 2 and x_obs_tensor.shape[0] == 1:
-            x_obs_tensor = x_obs_tensor.squeeze(0)
-        if x_obs_tensor.ndim == 1:
-            x_obs_2d = x_obs_tensor.reshape(self.D, -1).T
-        elif x_obs_tensor.ndim == 2 and x_obs_tensor.shape == (self.D, self.num_steps):
-            x_obs_2d = x_obs_tensor.T
-        else:
-            x_obs_2d = x_obs_tensor
-
-        x_jax = jnp.asarray(x_obs_2d.detach().cpu().numpy())
-        params_jax = jnp.asarray(parameters.detach().cpu().numpy())
-
-        key = jax.random.PRNGKey(self.seed)
-        keys = jax.random.split(key, num_samples)
-
-        v_ll = jax.vmap(
-            lambda th, k: self._pf_ll_fn(th, x_jax, k, n_particles=n_particles)
-        )
-        lls_jax = v_ll(params_jax, keys)
+        keys = jax.random.split(self._next_rng_key(), params.shape[0])
+        lls_jax = self._v_pf_ll_fn(params_jax, x_jax, keys, n_particles=n_particles)
         return torch.from_numpy(np.array(lls_jax, copy=True))
 
     @override
@@ -478,50 +226,7 @@ class DoubleWell(Simulator):
         step_size: float = 0.2,
         **kwargs,
     ) -> torch.Tensor:
-        r"""Sample from the true posterior $p(\tilde{\theta} \mid y_{1:T})$ using JAX Gibbs PMMH.
-
-        Mathematical Formulation:
-        -------------------------
-        The target posterior distribution is given by Bayes' rule:
-            $$p(\tilde{\theta} \mid y_{1:T}) \propto p(\tilde{\theta}) \, p(y_{1:T} \mid \tilde{\theta})$$
-        where:
-        - Prior: $\tilde{\theta} \sim \mathcal{N}(0, I_2)$ on latent parameter space.
-        - Parameters: Transformed via $\theta_1 = \exp(0.5 \tilde{\theta}_0) > 0$ and $\theta_2 = -\exp(0.5 \tilde{\theta}_1) < 0$.
-        - Conditioning Observation: The likelihood conditions on the raw state trajectory
-          observations $y_{1:T}$ (or subsampled observations), NOT on summary statistics.
-
-        Inference Algorithm:
-        --------------------
-        Gibbs Particle Marginal Metropolis-Hastings (PMMH) sampler:
-        1. Alternates between parameter random-walk updates (with frozen particle key)
-           and resampling of the particle filter random seeds.
-        2. The particle filter provides an unbiased marginal likelihood estimate $\hat{p}(y_{1:T} \mid \tilde{\theta})$,
-           guaranteeing convergence to the exact stationary posterior distribution $p(\tilde{\theta} \mid y_{1:T})$
-           (Andrieu et al., 2010).
-
-        Parameters
-        ----------
-        x_obs : torch.Tensor or np.ndarray, optional
-            Observed trajectory $y_{1:T}$. If None, defaults to the canonical reference
-            trajectory generated at $\tilde{\theta} = [0, 0]$ with seed 42.
-        num_samples : int, optional
-            Total number of posterior parameter samples to return (default: 1000).
-        n_chains : int, optional
-            Number of parallel MCMC chains run concurrently in JAX (default: 20).
-        burn_in : int, optional
-            Number of initial warmup steps discarded per chain (default: 200).
-        inner_thin : int, optional
-            Sub-sampling thinning factor between saved MCMC states (default: 4).
-        n_particles : int, optional
-            Number of particles used in the SMC particle filter (default: 150).
-        step_size : float, optional
-            Random-walk proposal standard deviation per parameter dimension (default: 0.2).
-
-        Returns
-        -------
-        torch.Tensor
-            Posterior samples of latent parameters $\tilde{\theta} \in \mathbb{R}^2$ with shape `(num_samples, 2)`.
-        """
+        """Sample from ``p(theta | y_{1:T})`` using JAX Gibbs PMMH."""
         if x_obs is None:
             # Default observation generated from theta = [0.0, 0.0] with seed 42
             x_obs = torch.tensor(
@@ -541,25 +246,12 @@ class DoubleWell(Simulator):
                 dtype=torch.float32,
             )
 
-        if isinstance(x_obs, np.ndarray):
-            x_obs = torch.from_numpy(x_obs).float()
-        x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
-        if x_obs_tensor.ndim == 2 and x_obs_tensor.shape[0] == 1:
-            x_obs_tensor = x_obs_tensor.squeeze(0)
-        if x_obs_tensor.ndim == 1:
-            x_obs_2d = x_obs_tensor.reshape(self.D, -1).T
-        elif x_obs_tensor.ndim == 2 and x_obs_tensor.shape == (self.D, self.num_steps):
-            x_obs_2d = x_obs_tensor.T
-        else:
-            x_obs_2d = x_obs_tensor
-        x_obs_jax = jnp.asarray(x_obs_2d.detach().cpu().numpy().astype(np.float32))
-
+        x_obs_jax = self._format_trajectory_obs(x_obs)
         num_samples_per_chain = math.ceil(num_samples / n_chains)
 
-        rng_key = jax.random.PRNGKey(self.seed)
         samples_jax = self._jax_mcmc(
             x_obs=x_obs_jax,
-            rng_key=rng_key,
+            rng_key=self._next_rng_key(),
             n_chains=n_chains,
             num_samples_per_chain=num_samples_per_chain,
             burn_in=burn_in,
@@ -567,5 +259,4 @@ class DoubleWell(Simulator):
             n_particles=n_particles,
             step_size=step_size,
         )
-        samples_np = np.array(samples_jax[:num_samples], copy=True)
-        return torch.from_numpy(samples_np)
+        return self._finalize_mcmc_samples(samples_jax, num_samples)

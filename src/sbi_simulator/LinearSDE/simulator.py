@@ -1,5 +1,6 @@
 """Simulator for the Linear Stochastic Differential Equation (SDE) model."""
 
+import functools
 import math
 from typing import override
 
@@ -10,15 +11,16 @@ import pyro.distributions as pdist
 import torch
 from jax.scipy.linalg import expm
 
-from ..base import Simulator
-from ..compositional import sample_two_step
+from ..dynamical import DynamicalSimulator
+from ..mcmc import build_batched_ll, build_mh_mcmc_sampler
+from ..summary_stats import trajectory_stats_2d_linear
 
 
 def matrix_fraction_decomposition(dt: float, A: jax.Array, B: jax.Array):
     r"""Van Loan (1978) matrix fraction decomposition for linear SDEs.
 
-    Computes transition matrix Phi = exp(A * dt) and diffusion covariance
-    Q = \int_0^{dt} exp(A * s) B B^T exp(A^T * s) ds in closed form.
+    Computes transition matrix ``Phi = exp(A * dt)`` and diffusion covariance
+    ``Q = \int_0^{dt} exp(A * s) B B^T exp(A^T * s) ds`` in closed form.
     """
     d = A.shape[-1]
     blockmatrix = jnp.block([[A, jnp.dot(B, B.T)], [jnp.zeros((d, d)), -A.T]])
@@ -29,8 +31,13 @@ def matrix_fraction_decomposition(dt: float, A: jax.Array, B: jax.Array):
     return Phi, Q
 
 
-def _build_linear_sde_system(variant: str = "periodic", sigma1: float = 0.1, sigma2: float = 0.1, d: int = 2):
-    """Build parameter-to-matrix mappings (A, B) for LinearSDE."""
+def _build_linear_sde_system(
+    variant: str = "periodic",
+    sigma1: float = 0.1,
+    sigma2: float = 0.1,
+    d: int = 2,
+):
+    """Build parameter-to-matrix mappings ``(A, B)`` for LinearSDE."""
     if variant == "periodic":
 
         def get_AB(theta):
@@ -39,11 +46,12 @@ def _build_linear_sde_system(variant: str = "periodic", sigma1: float = 0.1, sig
             return A, B
 
     elif variant == "general":
+        eye_d = jnp.eye(d)
 
         def get_AB(theta):
-            theta_sub = 0.5 * theta[: d**2].reshape((d, d)) - 2.0 * jnp.eye(d)
-            B_sub = 0.5 * theta[d**2 :].reshape((d, d)) + 0.5 * jnp.eye(d)
-            return theta_sub, B_sub
+            A = 0.5 * theta[: d**2].reshape((d, d)) - 2.0 * eye_d
+            B = 0.5 * theta[d**2 :].reshape((d, d)) + 0.5 * eye_d
+            return A, B
 
     else:
         raise ValueError(f"Unknown LinearSDE variant: {variant}")
@@ -51,8 +59,13 @@ def _build_linear_sde_system(variant: str = "periodic", sigma1: float = 0.1, sig
     return get_AB
 
 
-def _build_kalman_log_likelihood(get_AB, dt: float = 0.1, d: int = 2, obs_sigma: float = 0.01):
-    """Build exact JAX Kalman filter log-likelihood function."""
+def _build_kalman_log_likelihood(
+    get_AB,
+    dt: float = 0.1,
+    d: int = 2,
+    obs_sigma: float = 0.01,
+):
+    """Build exact single-Cholesky JAX Kalman filter log-likelihood function."""
     R = (obs_sigma**2) * jnp.eye(d)
     init_cov = 1e-5 * jnp.eye(d)
     log_2pi = d * jnp.log(2.0 * jnp.pi)
@@ -66,75 +79,118 @@ def _build_kalman_log_likelihood(get_AB, dt: float = 0.1, d: int = 2, obs_sigma:
             m, P = carry
             m_pred = jnp.dot(Phi, m)
             P_pred = jnp.dot(Phi, jnp.dot(P, Phi.T)) + Q
+            P_pred = 0.5 * (P_pred + P_pred.T)
 
             S = P_pred + R
             S = 0.5 * (S + S.T)
             r = y - m_pred
-            K = jnp.linalg.solve(S.T, P_pred.T).T
-            m_upd = m_pred + jnp.dot(K, r)
-            P_upd = P_pred - jnp.dot(K, jnp.dot(S, K.T))
-            P_upd = 0.5 * (P_upd + P_upd.T)
 
             L_S = jnp.linalg.cholesky(S)
+            V = jax.scipy.linalg.solve_triangular(L_S, P_pred, lower=True)
+            sol = jax.scipy.linalg.solve_triangular(L_S, r, lower=True)
+
+            m_upd = m_pred + jnp.dot(V.T, sol)
+            P_upd = P_pred - jnp.dot(V.T, V)
+            P_upd = 0.5 * (P_upd + P_upd.T)
+
             logdet = 2.0 * jnp.sum(jnp.log(jnp.diag(L_S)))
-            sol = jnp.linalg.solve(L_S, r)
-            quad = jnp.sum(sol**2)
-            ll_step = -0.5 * (log_2pi + logdet + quad)
+            ll_step = -0.5 * (log_2pi + logdet + jnp.sum(sol**2))
             return (m_upd, P_upd), ll_step
 
         _, lls = jax.lax.scan(kf_step, (mu0, init_cov), x_obs[1:])
         total_ll = jnp.sum(lls)
-        return jnp.where(jnp.isnan(total_ll), -1e9, total_ll)
+        return jnp.where(jnp.isfinite(total_ll), total_ll, -jnp.inf)
 
     return jax.jit(single_log_likelihood)
 
 
-def _build_linear_sde_sampler(kalman_ll_fn, dim_parameters: int):
-    """Build fast JAX MCMC sampler using exact Kalman filter marginal likelihood."""
-    log_prior_norm = (dim_parameters / 2.0) * jnp.log(2.0 * jnp.pi)
+def _build_linear_sde_jax_solvers(
+    get_AB,
+    dt: float,
+    d: int,
+    num_steps: int,
+    default_x0: tuple[float, ...],
+):
+    """Build JIT-compiled batched trajectory solver and batched single-step stepper."""
+    base_x0 = jnp.asarray(default_x0, dtype=jnp.float32)
 
-    def log_joint(theta, x_obs):
-        prior_lp = -0.5 * jnp.sum(theta**2) - log_prior_norm
-        return prior_lp + kalman_ll_fn(theta, x_obs)
+    def solve_single(rng_key, theta, x0=None):
+        u0 = base_x0 if x0 is None else x0
+        A, B = get_AB(theta)
+        Phi, Q = matrix_fraction_decomposition(dt, A, B)
+        L = jnp.linalg.cholesky(Q)
 
-    v_log_joint = jax.vmap(log_joint, in_axes=(0, None))
+        def step_fn(x, k):
+            noise = jax.random.normal(k, shape=(d,))
+            x_next = jnp.dot(Phi, x) + jnp.dot(L, noise)
+            return x_next, x_next
 
-    def run_mcmc(
-        x_obs,
-        rng_key,
-        n_chains: int = 20,
-        num_samples_per_chain: int = 500,
-        burn_in: int = 200,
-        step_size: float = 0.1,
-    ):
-        k_init, k_mcmc = jax.random.split(rng_key)
-        curr_thetas = jax.random.normal(k_init, shape=(n_chains, dim_parameters))
-        curr_lp = v_log_joint(curr_thetas, x_obs)
+        keys = jax.random.split(rng_key, num_steps - 1)
+        _, xs = jax.lax.scan(step_fn, u0, keys)
+        full_traj = jnp.concatenate([u0[None, :], xs], axis=0)  # (num_steps, d)
+        return full_traj.T  # (d, num_steps)
 
-        def step_fn(carry, subkey):
-            th, lp = carry
-            k_prop, k_acc = jax.random.split(subkey)
-            prop_th = th + jax.random.normal(k_prop, shape=th.shape) * step_size
-            prop_lp = v_log_joint(prop_th, x_obs)
-            alpha = jnp.minimum(1.0, jnp.exp(prop_lp - lp))
-            acc = jax.random.uniform(k_acc, shape=(n_chains,)) < alpha
-            new_th = jnp.where(acc[:, None], prop_th, th)
-            new_lp = jnp.where(acc, prop_lp, lp)
-            return (new_th, new_lp), new_th
+    solve_batch_fn = jax.vmap(solve_single, in_axes=(0, 0, 0))
 
-        total_steps = burn_in + num_samples_per_chain
-        keys = jax.random.split(k_mcmc, total_steps)
-        _, all_samples = jax.lax.scan(step_fn, (curr_thetas, curr_lp), keys)
-        post_burnin = all_samples[burn_in:]
-        return post_burnin.transpose(1, 0, 2).reshape(-1, dim_parameters)
+    def solve_batch(rng_keys, thetas, x0s=None):
+        if x0s is None:
+            x0s = jnp.broadcast_to(base_x0, (thetas.shape[0], d))
+        return solve_batch_fn(rng_keys, thetas, x0s)
 
-    return jax.jit(
-        run_mcmc,
-        static_argnames=["n_chains", "num_samples_per_chain", "burn_in"],
+    def single_step(th, curr_x, k, step_dt):
+        A, B = get_AB(th)
+        Phi, Q = matrix_fraction_decomposition(step_dt, A, B)
+        L = jnp.linalg.cholesky(Q)
+        noise = jax.random.normal(k, shape=(d,))
+        return jnp.dot(Phi, curr_x) + jnp.dot(L, noise)
+
+    step_batch_jit = jax.jit(jax.vmap(single_step, in_axes=(0, 0, 0, None)))
+    return jax.jit(solve_batch), step_batch_jit
+
+
+@functools.lru_cache(maxsize=32)
+def _get_linear_sde_jax_bundle(
+    variant: str,
+    d: int,
+    step_dt: float,
+    num_steps: int,
+    sigma1: float,
+    sigma2: float,
+    obs_sigma: float,
+    default_x0: tuple[float, ...],
+    dim_parameters: int,
+):
+    """Build and cache compiled LinearSDE JAX solver, stepper, Kalman LL, and MCMC."""
+    get_AB = _build_linear_sde_system(
+        variant=variant,
+        sigma1=sigma1,
+        sigma2=sigma2,
+        d=d,
     )
+    solve_batch, step_batch_jit = _build_linear_sde_jax_solvers(
+        get_AB,
+        dt=step_dt,
+        d=d,
+        num_steps=num_steps,
+        default_x0=default_x0,
+    )
+    kf_ll_fn = _build_kalman_log_likelihood(
+        get_AB,
+        dt=step_dt,
+        d=d,
+        obs_sigma=obs_sigma,
+    )
+    v_kf_ll_fn = build_batched_ll(kf_ll_fn, stochastic=False)
+    jax_mcmc = build_mh_mcmc_sampler(
+        kf_ll_fn,
+        dim_parameters=dim_parameters,
+        prior_type="gaussian",
+        init_strategy="prior",
+    )
+    return solve_batch, step_batch_jit, v_kf_ll_fn, jax_mcmc
 
 
-class LinearSDE(Simulator):
+class LinearSDE(DynamicalSimulator):
     r"""Linear Gaussian Stochastic Differential Equation (SDE) Simulator.
 
     Mathematical Model:
@@ -142,47 +198,20 @@ class LinearSDE(Simulator):
     The state is a $d$-dimensional vector $x(t) \in \mathbb{R}^d$ ($d=2$ by default) evolving
     under a linear continuous-time stochastic differential equation:
         $$dx_t = A(\theta) x_t \, dt + B(\theta) \, dW_t$$
-    where $W_t$ is standard $d$-dimensional Brownian motion.
 
     1. Prior Distribution & Variants:
        - `"periodic"`: $\theta \in \mathbb{R}^2 \sim \mathcal{N}(0, I_2)$.
-         Parameterizes a stochastic harmonic oscillator with drift matrix:
-             $$A(\theta) = \begin{pmatrix} 0 & -\theta_0^2 \\ \theta_1^2 & 0 \end{pmatrix}, \quad B = \text{diag}(\sigma_1, \sigma_2)$$
-         with fixed diffusion coefficients $\sigma_1 = \sigma_2 = 0.1$.
-       - `"general"`: $\theta \in \mathbb{R}^8 \sim \mathcal{N}(0, I_8)$.
-         Parameterizes arbitrary linear drift $A(\theta) = \text{reshape}(\theta_{0:4}, (2, 2))$
-         and Cholesky diffusion factor $L_B(\theta) = \text{reshape}(\theta_{4:8}, (2, 2))$ with $B = L_B L_B^T + 0.01 I_2$.
+         $$A(\theta) = \begin{pmatrix} 0 & -\theta_0^2 \\ \theta_1^2 & 0 \end{pmatrix}, \quad B = \text{diag}(\sigma_1, \sigma_2)$$
+       - `"general"`: $\theta \in \mathbb{R}^{2d^2} \sim \mathcal{N}(0, I_{2d^2})$.
+         $$A(\theta) = 0.5 \cdot \text{reshape}(\theta_{0:d^2}, (d, d)) - 2 I_d$$
+         $$B(\theta) = 0.5 \cdot \text{reshape}(\theta_{d^2:2d^2}, (d, d)) + 0.5 I_d$$
 
     2. Exact Continuous-to-Discrete Discretization:
-       Over observation step $\Delta t_{\text{obs}} = dt \times \text{inner\_steps} = 0.10$,
-       the discrete transition is exact and Gaussian:
-           $$x_{t+1} = F(\theta) x_t + w_t, \quad w_t \sim \mathcal{N}(0, Q(\theta))$$
-       where $F(\theta) = \exp(A(\theta) \Delta t_{\text{obs}})$ and process noise covariance
-       $Q(\theta) = \int_0^{\Delta t_{\text{obs}}} \exp(A s) B B^T \exp(A^T s) \, ds$
-       are computed in closed form using Van Loan's matrix exponential decomposition:
-           $$\exp \begin{pmatrix} A & B B^T \\ 0 & -A^T \end{pmatrix} \Delta t_{\text{obs}} = \begin{pmatrix} F & Q F^{-T} \\ 0 & F^{-T} \end{pmatrix}$$
+       Computed in closed form via Van Loan matrix fraction decomposition over $\Delta t_{\text{obs}}$.
 
-    3. Initial Condition & Observation Model:
-       Default initial condition $u_0 = [-0.5, 0.5]^T$.
-       Additive Gaussian observation noise with standard deviation $\sigma_{\text{obs}} = 0.01$:
-           $$y_t \sim \mathcal{N}(x_t, \sigma_{\text{obs}}^2 I_d), \quad t = 0, \dots, T-1$$
-
-    4. Summary Modes:
-       - `None`: Raw trajectory of shape $(d \times \text{num\_steps},) = (22,)$.
-       - `"subsample"`: Trajectory with additive Gaussian observation noise $\sigma_{\text{obs}}$, shape $(22,)$.
-       - `"stats"`: 9 summary statistics (mean, log-variance, ac1, ac2, cross-correlation).
-       - `"two_step"`: Transition pairs $(x_t, x_{t+1})$ of shape $(2d,) = (4,)$ for Markov SBI.
-
-    Posterior Distribution & Reference Sampling:
-    ---------------------------------------------
-    The posterior distribution is conditioned on the full trajectory observations $y_{1:T}$:
-        $$p(\theta \mid y_{1:T}) \propto p(\theta) \, p(y_{1:T} \mid \theta)$$
-
-    - Because the system is linear and Gaussian, the marginal likelihood $p(y_{1:T} \mid \theta)$
-      is computed **analytically in closed form** via the exact Kalman Filter:
-          $$\log p(y_{1:T} \mid \theta) = \sum_{t=1}^{T-1} \log \mathcal{N}(y_t \mid \hat{y}_{t \mid t-1}, S_t)$$
-      where $\hat{y}_{t \mid t-1} = F \mu_{t-1}$ and innovation covariance $S_t = F P_{t-1} F^T + Q + \sigma_{\text{obs}}^2 I_d$.
-    - Posterior samples are drawn via JAX-accelerated Metropolis-Hastings MCMC on the exact marginal likelihood.
+    3. Posterior Distribution:
+       Exact marginal likelihood $p(y_{1:T} \mid \theta)$ via the Kalman Filter,
+       sampled via parallel Metropolis-Hastings MCMC in JAX.
     """
 
     def __init__(
@@ -201,205 +230,89 @@ class LinearSDE(Simulator):
         **kwargs,
     ):
         self.variant = variant
-        self.d = d
-        self.dt = dt
-        self.inner_steps = inner_steps
-        self.step_dt = float(dt * inner_steps)  # Effective observation interval (default 0.1)
-        self.num_steps = num_steps
-        self.sigma1 = sigma1
-        self.sigma2 = sigma2
-        self.obs_sigma = obs_sigma
+        self.d = int(d)
+        self.dt = float(dt)
+        self.inner_steps = int(inner_steps)
+        self.step_dt = float(dt * inner_steps)
+        self.sigma1 = float(sigma1)
+        self.sigma2 = float(sigma2)
 
         if variant == "periodic":
             expected_dim = 2
         elif variant == "general":
-            expected_dim = 2 * (d**2)
+            expected_dim = 2 * (self.d**2)
         else:
             raise ValueError(f"Unknown variant: {variant}")
 
-        self.dim_parameters = dim_parameters
         if dim_parameters != expected_dim:
-            # Allow flexible dim_parameters if user passed explicit expected_dim
-            if dim_parameters in (2, 2 * (d**2)):
-                if dim_parameters == 2:
-                    self.variant = "periodic"
-                else:
-                    self.variant = "general"
+            if dim_parameters in (2, 2 * (self.d**2)):
+                self.variant = "periodic" if dim_parameters == 2 else "general"
             else:
                 raise ValueError(
                     f"LinearSDE variant='{self.variant}' expects dim_parameters={expected_dim}, "
                     f"got {dim_parameters}."
                 )
 
-        self.dim_data_raw = int(d * num_steps)
+        if summary in ("stats", "summary_stats") and self.d != 2:
+            raise ValueError(
+                f"LinearSDE summary='{summary}' requires state dimension d=2, got d={self.d}."
+            )
 
-        if summary is None or summary == "subsample":
-            self.dim_data = self.dim_data_raw
-        elif summary in ("stats", "summary_stats"):
-            self.dim_data = 9
-        elif summary == "two_step":
-            self.dim_data = 2 * d
-        else:
-            raise NotImplementedError(f"Unknown summary mode: {summary}")
-        self.summary = summary
+        u0_tuple = (-0.5, 0.5) if self.d == 2 else (0.0,) * self.d
+        u0 = torch.tensor(u0_tuple, dtype=torch.float32)
+        dim_data = self._resolve_summary_dim(
+            summary,
+            dim_raw=int(self.d * num_steps),
+            dim_stats=9,
+            dim_two_step=2 * self.d,
+        )
 
-        super().__init__(seed, self.dim_parameters, self.dim_data, **kwargs)
+        super().__init__(
+            seed=seed,
+            dim_parameters=dim_parameters,
+            dim_data=dim_data,
+            state_dim=self.d,
+            num_steps=num_steps,
+            obs_sigma=obs_sigma,
+            summary=summary,
+            u0=u0,
+            **kwargs,
+        )
 
-        self.u0 = torch.tensor([-0.5, 0.5] if d == 2 else [0.0] * d, dtype=torch.float32)
-
-        # Prior setup: Standard Normal N(0, I_D)
-        self.prior_loc = [0.0] * self.dim_parameters
-        self.prior_scale = [1.0] * self.dim_parameters
         self.prior_dist = pdist.Normal(
             loc=torch.zeros(self.dim_parameters, dtype=torch.float32),
             scale=torch.ones(self.dim_parameters, dtype=torch.float32),
         ).to_event(1)
 
-        # Build JAX operators
-        self._get_AB = _build_linear_sde_system(
-            variant=self.variant,
-            sigma1=self.sigma1,
-            sigma2=self.sigma2,
-            d=self.d,
+        (
+            self._jax_solver_batch,
+            self._jax_step_batch,
+            self._v_kf_ll_fn,
+            self._jax_mcmc,
+        ) = _get_linear_sde_jax_bundle(
+            self.variant,
+            self.d,
+            self.step_dt,
+            self.num_steps,
+            self.sigma1,
+            self.sigma2,
+            self.obs_sigma,
+            u0_tuple,
+            self.dim_parameters,
         )
-        self._kf_ll_fn = _build_kalman_log_likelihood(
-            self._get_AB,
-            dt=self.step_dt,
-            d=self.d,
-            obs_sigma=self.obs_sigma,
-        )
-        self._jax_mcmc = _build_linear_sde_sampler(
-            self._kf_ll_fn,
-            dim_parameters=self.dim_parameters,
-        )
-
-        # Build JAX trajectory solver
-        self._jax_solver_batch = self._build_jax_solver()
-
-    def _build_jax_solver(self):
-        get_AB = self._get_AB
-        dt = self.step_dt
-        d = self.d
-        num_steps = self.num_steps
-        default_x0 = jnp.asarray(self.u0.numpy())
-
-        def solve_single(rng_key, theta, x0=None):
-            u0 = default_x0 if x0 is None else x0
-            A, B = get_AB(theta)
-            Phi, Q = matrix_fraction_decomposition(dt, A, B)
-            L = jnp.linalg.cholesky(Q)
-
-            def step_fn(x, k):
-                noise = jax.random.normal(k, shape=(d,))
-                x_next = jnp.dot(Phi, x) + jnp.dot(L, noise)
-                return x_next, x_next
-
-            keys = jax.random.split(rng_key, num_steps - 1)
-            _, xs = jax.lax.scan(step_fn, u0, keys)
-            full_traj = jnp.concatenate([u0[None, :], xs], axis=0)  # (num_steps, d)
-            return full_traj.T  # (d, num_steps)
-
-        solve_batch_fn = jax.vmap(solve_single, in_axes=(0, 0, 0))
-
-        def solve_batch(rng_keys, thetas, x0s=None):
-            if x0s is None:
-                x0s = jnp.broadcast_to(default_x0, (thetas.shape[0], d))
-            return solve_batch_fn(rng_keys, thetas, x0s)
-
-        return jax.jit(solve_batch)
-
-    def _solve(
-        self,
-        parameters: torch.Tensor,
-        u0: torch.Tensor | None = None,
-        rng_key: jax.Array | None = None,
-    ) -> torch.Tensor:
-        """Batched exact discrete simulation accelerated via JAX Matrix Fraction Decomposition.
-
-        parameters: (num_samples, dim_parameters)
-        u0: optional (num_samples, d)
-        returns: (num_samples, d, num_steps)
-        """
-        params_np = parameters.detach().cpu().numpy().astype(np.float32)
-        params_jax = jnp.asarray(params_np)
-        batch_size = params_jax.shape[0]
-
-        if rng_key is None:
-            rng_key = jax.random.PRNGKey(self.seed)
-        keys = jax.random.split(rng_key, batch_size)
-
-        if u0 is not None:
-            u0_np = u0.detach().cpu().numpy().astype(np.float32)
-            u0_jax = jnp.asarray(u0_np)
-            res_jax = self._jax_solver_batch(keys, params_jax, u0_jax)
-        else:
-            res_jax = self._jax_solver_batch(keys, params_jax)
-
-        res_np = np.array(res_jax, copy=True)
-        return torch.from_numpy(res_np)
 
     def get_prior_x0(self) -> pdist.Distribution:
-        """Prior over initial condition x0 in R^d."""
+        """Prior over initial condition ``x0`` in ``R^d``."""
         return pdist.Uniform(
             low=torch.full((self.d,), -2.0, dtype=torch.float32),
             high=torch.full((self.d,), 2.0, dtype=torch.float32),
         ).to_event(1)
 
     @staticmethod
+    @override
     def compute_summary_stats(us: torch.Tensor) -> torch.Tensor:
-        """Compute 9 summary statistics from (num_samples, 2, T) trajectory tensor."""
-        is_2d_traj = us.ndim == 2
-        if is_2d_traj:
-            us = us.unsqueeze(0)
-
-        eps = 1e-6
-        x = us[:, 0, :]
-        y = us[:, 1, :]
-
-        mean_x = x.mean(dim=-1, keepdim=True)
-        mean_y = y.mean(dim=-1, keepdim=True)
-
-        dx = x - mean_x
-        dy = y - mean_y
-
-        var_x = (dx**2).mean(dim=-1, keepdim=True)
-        var_y = (dy**2).mean(dim=-1, keepdim=True)
-
-        log_var_x = torch.log(var_x.clamp_min(eps))
-        log_var_y = torch.log(var_y.clamp_min(eps))
-
-        t_steps = us.shape[-1]
-        denom_x = var_x.clamp_min(eps)
-        denom_y = var_y.clamp_min(eps)
-
-        if t_steps >= 2:
-            ac1_x = (dx[:, 1:] * dx[:, :-1]).mean(dim=-1, keepdim=True) / denom_x
-            ac1_y = (dy[:, 1:] * dy[:, :-1]).mean(dim=-1, keepdim=True) / denom_y
-        else:
-            ac1_x = torch.zeros_like(mean_x)
-            ac1_y = torch.zeros_like(mean_y)
-
-        if t_steps >= 3:
-            ac2_x = (dx[:, 2:] * dx[:, :-2]).mean(dim=-1, keepdim=True) / denom_x
-            ac2_y = (dy[:, 2:] * dy[:, :-2]).mean(dim=-1, keepdim=True) / denom_y
-        else:
-            ac2_x = torch.zeros_like(mean_x)
-            ac2_y = torch.zeros_like(mean_y)
-
-        denom_xy = torch.sqrt(denom_x * denom_y)
-        cc_xy = (dx * dy).mean(dim=-1, keepdim=True) / denom_xy
-
-        ac1_x = torch.nan_to_num(ac1_x.clamp(-1.0, 1.0), nan=0.0)
-        ac2_x = torch.nan_to_num(ac2_x.clamp(-1.0, 1.0), nan=0.0)
-        ac1_y = torch.nan_to_num(ac1_y.clamp(-1.0, 1.0), nan=0.0)
-        ac2_y = torch.nan_to_num(ac2_y.clamp(-1.0, 1.0), nan=0.0)
-        cc_xy = torch.nan_to_num(cc_xy.clamp(-1.0, 1.0), nan=0.0)
-
-        stats = torch.cat(
-            [mean_x, mean_y, log_var_x, log_var_y, ac1_x, ac1_y, ac2_x, ac2_y, cc_xy],
-            dim=-1,
-        )
-        return stats.squeeze(0) if is_2d_traj else stats
+        """Compute 9 summary statistics from ``(num_samples, 2, T)`` trajectory tensor."""
+        return trajectory_stats_2d_linear(us)
 
     def stepper(
         self,
@@ -407,170 +320,33 @@ class LinearSDE(Simulator):
         parameters: torch.Tensor,
         dt: float | None = None,
     ) -> torch.Tensor:
-        """Simulate a single time-series step transition for LinearSDE."""
-        x_t = torch.as_tensor(x, dtype=torch.float32)
-        params = torch.as_tensor(parameters, dtype=torch.float32)
+        """Simulate a single observation-step transition for LinearSDE."""
+        x_t, params, is_1d = self._broadcast_stepper_inputs(x, parameters)
 
-        is_1d = x_t.ndim == 1
-        if is_1d:
-            x_t = x_t.unsqueeze(0)
-        if params.ndim == 1:
-            params = params.unsqueeze(0)
-        if params.shape[0] == 1 and x_t.shape[0] > 1:
-            params = params.expand(x_t.shape[0], -1)
-        elif x_t.shape[0] == 1 and params.shape[0] > 1:
-            x_t = x_t.expand(params.shape[0], -1)
+        params_jax = jnp.asarray(params.detach().cpu().numpy(), dtype=jnp.float32)
+        x_jax = jnp.asarray(x_t.detach().cpu().numpy(), dtype=jnp.float32)
+        step_dt = float(self.step_dt if dt is None else dt)
 
-        params_jax = jnp.asarray(params.detach().cpu().numpy())
-        x_jax = jnp.asarray(x_t.detach().cpu().numpy())
-        step_dt = self.step_dt if dt is None else dt
-
-        def single_step(th, curr_x, k):
-            A, B = self._get_AB(th)
-            Phi, Q = matrix_fraction_decomposition(step_dt, A, B)
-            L = jnp.linalg.cholesky(Q)
-            noise = jax.random.normal(k, shape=(self.d,))
-            return jnp.dot(Phi, curr_x) + jnp.dot(L, noise)
-
-        keys = jax.random.split(jax.random.PRNGKey(self.seed), params.shape[0])
-        next_x_jax = jax.vmap(single_step)(params_jax, x_jax, keys)
+        keys = jax.random.split(self._next_rng_key(), params.shape[0])
+        next_x_jax = self._jax_step_batch(params_jax, x_jax, keys, step_dt)
         next_x = torch.from_numpy(np.array(next_x_jax, copy=True))
         return next_x.squeeze(0) if is_1d else next_x
-
-    def simulate_two_step(
-        self,
-        parameters: torch.Tensor,
-        x0: torch.Tensor | None = None,
-        t: int | torch.Tensor | None = None,
-        informed: bool = True,
-        return_dict: bool = False,
-    ) -> torch.Tensor | dict[str, torch.Tensor]:
-        """Generate two-step transition pairs (x_t, x_{t+1}) for compositional SBI."""
-        return sample_two_step(
-            self,
-            parameters=parameters,
-            x0=x0,
-            t=t,
-            informed=informed,
-            return_dict=return_dict,
-        )
-
-    @override
-    def simulate(self, parameters: torch.Tensor | np.ndarray) -> torch.Tensor:
-        """Simulate trajectories given parameter tensor."""
-        parameters = torch.as_tensor(parameters, dtype=torch.float32)
-
-        if parameters.numel() == 0:
-            raise ValueError("Expected at least one parameter.")
-
-        is_1d = parameters.ndim == 1
-        if is_1d:
-            parameters = parameters.unsqueeze(0)
-
-        num_samples = parameters.shape[0]
-
-        if self.summary == "two_step":
-            pairs = self.simulate_two_step(parameters, return_dict=False)
-            pairs_flat = pairs.reshape(num_samples, 2 * self.d)
-            return pairs_flat.squeeze(0) if is_1d else pairs_flat
-
-        us = self._solve(parameters)  # (num_samples, d, num_steps)
-        us = us.float()
-
-        has_nan = torch.isnan(us.reshape(num_samples, -1)).any(dim=1)
-        idx_contains_nan = torch.where(has_nan)[0]
-        idx_contains_no_nan = torch.where(~has_nan)[0]
-
-        if self.summary is None:
-            traj_flat = us.reshape(num_samples, -1)
-            return traj_flat.squeeze(0) if is_1d else traj_flat
-
-        if self.summary == "subsample":
-            data = torch.full(
-                (num_samples, self.dim_data),
-                float("nan"),
-                dtype=torch.float32,
-            )
-
-            if len(idx_contains_nan) == num_samples:
-                return data.squeeze(0) if is_1d else data
-
-            raw_data = us[idx_contains_no_nan, :, :].reshape(
-                len(idx_contains_no_nan), -1
-            )
-            noise = torch.randn_like(raw_data) * self.obs_sigma
-            sampled = raw_data + noise
-
-            data[idx_contains_no_nan, :] = sampled
-            return data.squeeze(0) if is_1d else data
-
-        if self.summary in ("stats", "summary_stats"):
-            data = torch.full(
-                (num_samples, self.dim_data),
-                float("nan"),
-                dtype=torch.float32,
-            )
-
-            if len(idx_contains_nan) == num_samples:
-                return data.squeeze(0) if is_1d else data
-
-            stats = self.compute_summary_stats(us[idx_contains_no_nan, :, :])
-            data[idx_contains_no_nan, :] = stats
-            return data.squeeze(0) if is_1d else data
-
-        raise ValueError(f"Unknown summary mode: {self.summary}")
 
     @override
     def get_prior(self) -> pdist.Distribution:
         return self.prior_dist
 
-    def log_likelihood(self, parameters: torch.Tensor, x_obs: torch.Tensor) -> torch.Tensor:
-        r"""Evaluate exact marginal log-likelihood $\log p(y_{1:T} \mid \theta)$ via Kalman Filter.
+    def log_likelihood(
+        self,
+        parameters: torch.Tensor | np.ndarray,
+        x_obs: torch.Tensor | np.ndarray,
+    ) -> torch.Tensor:
+        """Evaluate exact marginal log-likelihood ``log p(y_{1:T} | theta)`` via Kalman Filter."""
+        params, _ = self._prepare_parameters(parameters)
+        x_jax = self._format_trajectory_obs(x_obs)
+        params_jax = jnp.asarray(params.detach().cpu().numpy(), dtype=jnp.float32)
 
-        Mathematical Formulation:
-        -------------------------
-        Exact marginal log-likelihood integrating out the continuous Gaussian diffusion path:
-            $$\log p(y_{1:T} \mid \theta) = \sum_{t=1}^{T-1} \log \mathcal{N}(y_t \mid \hat{y}_{t \mid t-1}, S_t)$$
-        where:
-        - Prior state prediction: $\hat{x}_{t \mid t-1} = F(\theta) \mu_{t-1}$
-        - Prior covariance prediction: $P_{t \mid t-1} = F(\theta) P_{t-1} F(\theta)^T + Q(\theta)$
-        - Innovation: $r_t = y_t - \hat{x}_{t \mid t-1}$
-        - Innovation covariance: $S_t = P_{t \mid t-1} + \sigma_{\text{obs}}^2 I_d$
-        - Measurement update: $\mu_t = \hat{x}_{t \mid t-1} + P_{t \mid t-1} S_t^{-1} r_t$,
-          $P_t = P_{t \mid t-1} - P_{t \mid t-1} S_t^{-1} P_{t \mid t-1}$.
-
-        Parameters
-        ----------
-        parameters : torch.Tensor
-            Parameter tensor $\theta$, shape `(dim_parameters,)` or `(batch_size, dim_parameters)`.
-        x_obs : torch.Tensor
-            Observed trajectory $y_{1:T}$, shape `(d * num_steps,)`, `(d, num_steps)`,
-            or `(num_steps, d)`.
-
-        Returns
-        -------
-        torch.Tensor
-            Exact log-likelihood values of shape `(batch_size,)`.
-        """
-        parameters = torch.as_tensor(parameters, dtype=torch.float32)
-        if parameters.ndim == 1:
-            parameters = parameters.unsqueeze(0)
-
-        x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
-        if x_obs_tensor.ndim == 2 and x_obs_tensor.shape[0] == 1:
-            x_obs_tensor = x_obs_tensor.squeeze(0)
-        if x_obs_tensor.ndim == 1:
-            x_obs_2d = x_obs_tensor.reshape(self.d, -1).T
-        elif x_obs_tensor.ndim == 2 and x_obs_tensor.shape == (self.d, self.num_steps):
-            x_obs_2d = x_obs_tensor.T
-        else:
-            x_obs_2d = x_obs_tensor
-
-        x_jax = jnp.asarray(x_obs_2d.detach().cpu().numpy())
-        params_jax = jnp.asarray(parameters.detach().cpu().numpy())
-
-        v_ll = jax.vmap(lambda th: self._kf_ll_fn(th, x_jax))
-        lls_jax = v_ll(params_jax)
+        lls_jax = self._v_kf_ll_fn(params_jax, x_jax)
         return torch.from_numpy(np.array(lls_jax, copy=True))
 
     @override
@@ -583,45 +359,7 @@ class LinearSDE(Simulator):
         step_size: float = 0.1,
         **kwargs,
     ) -> torch.Tensor:
-        r"""Sample from the exact posterior $p(\theta \mid y_{1:T})$ using JAX MCMC.
-
-        Mathematical Formulation:
-        -------------------------
-        The target posterior distribution is given by Bayes' rule:
-            $$p(\theta \mid y_{1:T}) \propto p(\theta) \, p(y_{1:T} \mid \theta)$$
-        where:
-        - Prior: $\theta \sim \mathcal{N}(0, I)$ on parameter space.
-        - Likelihood: Exact marginal likelihood $p(y_{1:T} \mid \theta)$ computed in closed form
-          via the Kalman Filter scan over the discrete Gaussian state-space model.
-        - Conditioning Observation: The likelihood conditions on the raw state trajectory
-          observations $y_{1:T}$ (or subsampled observations), NOT on summary statistics.
-
-        Inference Algorithm:
-        --------------------
-        Metropolis-Hastings MCMC in JAX using Gaussian random walk proposals:
-            $$\theta^* \sim \mathcal{N}(\theta, \text{step\_size}^2 I)$$
-        Because the Kalman filter evaluates the exact marginalized likelihood, no particle filter
-        approximation is required, providing highly accurate and fast posterior sampling.
-
-        Parameters
-        ----------
-        x_obs : torch.Tensor or np.ndarray, optional
-            Observed trajectory $y_{1:T}$. If None, defaults to the canonical reference
-            trajectory generated at $\theta = [1.0, 1.0]$ with seed 42.
-        num_samples : int, optional
-            Total number of posterior parameter samples to return (default: 1000).
-        n_chains : int, optional
-            Number of parallel MCMC chains run concurrently in JAX (default: 20).
-        burn_in : int, optional
-            Number of initial warmup steps discarded per chain (default: 200).
-        step_size : float, optional
-            Random-walk proposal standard deviation per parameter dimension (default: 0.1).
-
-        Returns
-        -------
-        torch.Tensor
-            Posterior samples of parameters $\theta$ with shape `(num_samples, dim_parameters)`.
-        """
+        """Sample from the exact posterior ``p(theta | y_{1:T})`` via JAX MCMC."""
         if x_obs is None:
             # Default observation generated from theta = [1.0, 1.0] with seed 42
             x_obs = torch.tensor(
@@ -641,29 +379,16 @@ class LinearSDE(Simulator):
                 dtype=torch.float32,
             )
 
-        if isinstance(x_obs, np.ndarray):
-            x_obs = torch.from_numpy(x_obs).float()
-        x_obs_tensor = torch.as_tensor(x_obs, dtype=torch.float32)
-        if x_obs_tensor.ndim == 2 and x_obs_tensor.shape[0] == 1:
-            x_obs_tensor = x_obs_tensor.squeeze(0)
-        if x_obs_tensor.ndim == 1:
-            x_obs_2d = x_obs_tensor.reshape(self.d, -1).T
-        elif x_obs_tensor.ndim == 2 and x_obs_tensor.shape == (self.d, self.num_steps):
-            x_obs_2d = x_obs_tensor.T
-        else:
-            x_obs_2d = x_obs_tensor
-        x_obs_jax = jnp.asarray(x_obs_2d.detach().cpu().numpy().astype(np.float32))
-
+        x_obs_jax = self._format_trajectory_obs(x_obs)
         num_samples_per_chain = math.ceil(num_samples / n_chains)
 
-        rng_key = jax.random.PRNGKey(self.seed)
         samples_jax = self._jax_mcmc(
             x_obs=x_obs_jax,
-            rng_key=rng_key,
+            rng_key=self._next_rng_key(),
             n_chains=n_chains,
             num_samples_per_chain=num_samples_per_chain,
             burn_in=burn_in,
+            inner_thin=1,
             step_size=step_size,
         )
-        samples_np = np.array(samples_jax[:num_samples], copy=True)
-        return torch.from_numpy(samples_np)
+        return self._finalize_mcmc_samples(samples_jax, num_samples)

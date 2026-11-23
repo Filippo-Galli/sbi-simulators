@@ -91,8 +91,10 @@ def build_batched_ll(ll_fn, stochastic: bool = False):
         Whether ``ll_fn`` takes a per-sample PRNG key and static ``n_particles``.
     """
     if stochastic:
-        v_ll = jax.vmap(ll_fn, in_axes=(0, None, 0, None))
-        return jax.jit(v_ll, static_argnames=["n_particles"])
+        v_ll = jax.jit(jax.vmap(ll_fn, in_axes=(0, None, 0, None)), static_argnums=(3,))
+        return lambda thetas, x_obs, keys, n_particles=150: v_ll(
+            thetas, x_obs, keys, n_particles
+        )
     return jax.jit(jax.vmap(ll_fn, in_axes=(0, None)))
 
 
