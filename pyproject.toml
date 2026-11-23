@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sbi-simulator"
-version = "0.3.0"
+version = "0.3.1"
 description = "Simulation-based inference (SBI) benchmark simulators"
 readme = "README.md"
 requires-python = ">=3.12"
