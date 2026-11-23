@@ -355,6 +355,7 @@ class LinearSDE(DynamicalSimulator):
         n_chains: int = 20,
         burn_in: int = 200,
         step_size: float = 0.1,
+        adapt_warmup: bool = True,
         **kwargs,
     ) -> torch.Tensor:
         """Sample from the exact posterior ``p(theta | y_{1:T})`` via JAX MCMC."""
@@ -388,5 +389,6 @@ class LinearSDE(DynamicalSimulator):
             burn_in=burn_in,
             inner_thin=1,
             step_size=step_size,
+            adapt_warmup=adapt_warmup,
         )
         return self._finalize_mcmc_samples(samples_jax, num_samples)

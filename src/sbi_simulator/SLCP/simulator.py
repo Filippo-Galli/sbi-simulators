@@ -314,6 +314,7 @@ class SLCP(Simulator):
         thin: int = 4,
         step_size: float = 0.08,
         n_sir: int = 5000,
+        adapt_warmup: bool = True,
         **kwargs,
     ) -> torch.Tensor:
         """Sample from the true multimodal posterior ``p(theta | x_obs)`` via JAX MCMC."""
@@ -350,6 +351,7 @@ class SLCP(Simulator):
             inner_thin=thin,
             step_size=step_size,
             n_sir=n_sir,
+            adapt_warmup=adapt_warmup,
         )
 
         samples_np = np.array(samples_jax, copy=True)

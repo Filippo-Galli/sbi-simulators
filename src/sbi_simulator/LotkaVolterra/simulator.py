@@ -385,6 +385,8 @@ def _get_lv_mcmc_bundle(
             ll_fn,
             prior=prior_spec,
             default_init_theta=default_init_theta,
+            init_strategy="sir_pool",
+            rescue_stuck_chains=True,
         )
         return v_ll_fn, jax_mcmc
 
@@ -742,11 +744,13 @@ class LotkaVolterra(DynamicalSimulator):
         self,
         x_obs: torch.Tensor | np.ndarray | None = None,
         num_samples: int = 1000,
-        n_chains: int = 20,
-        burn_in: int = 200,
-        inner_thin: int = 4,
+        n_chains: int | None = None,
+        burn_in: int | None = None,
+        inner_thin: int | None = None,
         n_particles: int = 150,
         step_size: float | None = None,
+        n_sir: int | None = None,
+        adapt_warmup: bool = True,
         **kwargs,
     ) -> torch.Tensor:
         """Sample from ``p(theta | y_{1:T})`` using JAX MCMC / Gibbs PMMH."""
@@ -761,7 +765,13 @@ class LotkaVolterra(DynamicalSimulator):
                     self.canonical_theta.unsqueeze(0), u0=self.u0.unsqueeze(0)
                 )[0].T
 
-        if self.mode == "ode":
+        is_ode = self.mode == "ode"
+        eff_n_chains = (32 if is_ode else 20) if n_chains is None else int(n_chains)
+        eff_burn_in = (500 if is_ode else 200) if burn_in is None else int(burn_in)
+        eff_inner_thin = (8 if is_ode else 4) if inner_thin is None else int(inner_thin)
+        eff_n_sir = (4096 if is_ode else 50) if n_sir is None else int(n_sir)
+
+        if is_ode:
             x_jax, _ = self._prepare_ode_obs(x_obs)
         else:
             x_jax = self._format_trajectory_obs(x_obs)
@@ -771,30 +781,33 @@ class LotkaVolterra(DynamicalSimulator):
             if (is_default_obs and self._default_x_obs is not None)
             else self._next_rng_key()
         )
-        num_samples_per_chain = math.ceil(num_samples / n_chains)
+        num_samples_per_chain = math.ceil(num_samples / eff_n_chains)
         eff_step_size = (
             self.default_step_size if step_size is None else float(step_size)
         )
 
-        if self.mode == "ode":
+        if is_ode:
             samples_jax = self._jax_mcmc(
                 x_jax,
                 rng_key,
-                n_chains=n_chains,
+                n_chains=eff_n_chains,
                 num_samples_per_chain=num_samples_per_chain,
-                burn_in=burn_in,
-                inner_thin=inner_thin,
+                burn_in=eff_burn_in,
+                inner_thin=eff_inner_thin,
                 step_size=eff_step_size,
+                n_sir=eff_n_sir,
+                adapt_warmup=adapt_warmup,
             )
         else:
             samples_jax = self._jax_mcmc(
                 x_jax,
                 rng_key,
-                n_chains=n_chains,
+                n_chains=eff_n_chains,
                 num_samples_per_chain=num_samples_per_chain,
-                burn_in=burn_in,
-                inner_thin=inner_thin,
+                burn_in=eff_burn_in,
+                inner_thin=eff_inner_thin,
                 n_particles=n_particles,
                 step_size=eff_step_size,
+                n_sir=eff_n_sir,
             )
         return self._finalize_mcmc_samples(samples_jax, num_samples)
