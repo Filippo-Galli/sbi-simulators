@@ -20,6 +20,7 @@ from sbi_simulator import (
     GaussianGaussianPreset,
     LinearSDE,
     LogNormalPrior,
+    Lorenz63,
     LotkaVolterra,
     LVPreset,
     NormalPrior,
@@ -43,6 +44,7 @@ EXPECTED_SIMULATORS = [
     "DoubleWell",
     "GaussianGaussian",
     "LinearSDE",
+    "Lorenz63",
     "SpikeSlab",
     "SIR",
     "SLCP",
@@ -894,6 +896,55 @@ def test_ode_stepper_matches_solve_rk4():
     traj_lv = lv_ode._solve(th_lv)
     step_lv = lv_ode.stepper(lv_ode.u0, th_lv)
     assert torch.allclose(step_lv, traj_lv[0, :, 1], atol=1e-4)
+
+
+def test_lorenz63_trajectory_and_transitions():
+    from scipy.integrate import solve_ivp
+
+    sim = Lorenz63(num_steps=4, spinup_steps=5)
+    theta = sim.canonical_theta
+
+    def rhs(_, state):
+        x, y, z = state
+        return 10 * (y - x), x * (28 - z) - y, x * y - (8 / 3) * z
+
+    times = [0.10, 0.12, 0.14, 0.16]
+    reference = solve_ivp(
+        rhs, (0.0, times[-1]), [1.0, 1.0, 1.0], t_eval=times, rtol=1e-10, atol=1e-12
+    )
+    trajectory = sim.simulate(theta.numpy()).reshape(3, sim.num_steps)
+    torch.testing.assert_close(
+        trajectory, torch.tensor(reference.y).float(), rtol=2e-5, atol=2e-5
+    )
+
+    informed = sim.simulate_two_step(theta.unsqueeze(0), x0=sim.u0, t=1)
+    torch.testing.assert_close(informed[0], trajectory[:, 1:3].T)
+    local = sim.simulate_two_step(theta, x0=trajectory[:, 1], informed=False)
+    torch.testing.assert_close(local, informed[0])
+
+    sim.reset_rng()
+    states = sim.get_prior_x0(num_sims=3, num_steps=20).sample((5,))
+    assert states.shape == (5, 3) and torch.isfinite(states).all()
+    sim.reset_rng()
+    torch.testing.assert_close(
+        sim.get_prior_x0(num_sims=3, num_steps=20).sample((5,)), states
+    )
+
+
+@pytest.mark.parametrize("summary", [None, "subsample", "stats", "summary_stats", "two_step"])
+def test_lorenz63_reference_posterior(summary):
+    sim = Lorenz63(num_steps=5, spinup_steps=5, summary=summary)
+    theta = sim.canonical_theta
+    observation = sim.simulate(theta)
+    assert observation.shape == (sim.dim_data,)
+
+    ll = sim.log_likelihood(torch.stack((theta, theta + 0.2)), observation.numpy())
+    assert torch.isfinite(ll).all() and ll[0] > ll[1]
+
+    samples = sim.posterior_samples(
+        observation, num_samples=8, n_chains=2, burn_in=10, inner_thin=1, n_sir=32
+    )
+    assert samples.shape == (8, 3) and torch.isfinite(samples).all()
 
 
 def test_compositional_two_step_edge_cases():

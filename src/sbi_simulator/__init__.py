@@ -14,6 +14,7 @@ from .GaussianGaussian import (
     GaussianGaussianPreset,
 )
 from .LinearSDE import LinearSDE
+from .Lorenz63 import Lorenz63
 from .LotkaVolterra import LV_PRESETS, LotkaVolterra, LVPreset
 from .priors import (
     LogNormalPrior,
@@ -43,6 +44,7 @@ SIMULATORS = {
     "DoubleWell": DoubleWell,
     "GaussianGaussian": GaussianGaussian,
     "LinearSDE": LinearSDE,
+    "Lorenz63": Lorenz63,
     "LotkaVolterra": LotkaVolterra,
     "SIR": SIR,
     "SLCP": SLCP,
@@ -68,6 +70,7 @@ __all__ = [
     "LVPreset",
     "LinearSDE",
     "LogNormalPrior",
+    "Lorenz63",
     "LotkaVolterra",
     "NormalPrior",
     "PriorSpec",
