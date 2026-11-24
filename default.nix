@@ -5,6 +5,7 @@
   numpy,
   pyro-ppl,
   pytestCheckHook,
+  scikit-learn,
   scipy,
   setuptools,
   torch,
@@ -45,6 +46,7 @@ buildPythonPackage (finalAttrs: {
 
   nativeCheckInputs = [
     pytestCheckHook
+    scikit-learn
   ];
 
   meta = {

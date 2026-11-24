@@ -12,6 +12,7 @@ pkgs.mkShell {
     ty
     pkgs.python3Packages.corner
     pkgs.python3Packages.numpy
+    pkgs.python3Packages.scikit-learn
   ];
 
   shellHook = ''
