@@ -209,8 +209,12 @@ class DynamicalSimulator(Simulator):
         """Apply observation model / summary transform to valid trajectories."""
         num_valid = us_valid.shape[0]
         if self.summary == "subsample":
-            raw_data = us_valid.reshape(num_valid, -1)
-            return raw_data + torch.randn_like(raw_data) * self.obs_sigma
+            noisy = us_valid.clone()
+            if noisy.shape[-1] > 1:
+                noisy[:, :, 1:] = (
+                    noisy[:, :, 1:] + torch.randn_like(noisy[:, :, 1:]) * self.obs_sigma
+                )
+            return noisy.reshape(num_valid, -1)
         if self.summary in ("stats", "summary_stats"):
             return self.compute_summary_stats(us_valid)
         raise ValueError(f"Unknown summary mode: {self.summary}")
