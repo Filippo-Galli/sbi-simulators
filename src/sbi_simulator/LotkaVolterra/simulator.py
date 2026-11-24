@@ -754,7 +754,6 @@ class LotkaVolterra(DynamicalSimulator):
         **kwargs,
     ) -> torch.Tensor:
         """Sample from ``p(theta | y_{1:T})`` using JAX MCMC / Gibbs PMMH."""
-        is_default_obs = x_obs is None
         if x_obs is None:
             if self._default_x_obs is not None:
                 x_obs = torch.tensor(self._default_x_obs, dtype=torch.float32)
@@ -766,9 +765,9 @@ class LotkaVolterra(DynamicalSimulator):
                 )[0].T
 
         is_ode = self.mode == "ode"
-        eff_n_chains = (32 if is_ode else 20) if n_chains is None else int(n_chains)
-        eff_burn_in = (500 if is_ode else 200) if burn_in is None else int(burn_in)
-        eff_inner_thin = (8 if is_ode else 4) if inner_thin is None else int(inner_thin)
+        eff_n_chains = (40 if is_ode else 48) if n_chains is None else int(n_chains)
+        eff_burn_in = (600 if is_ode else 180) if burn_in is None else int(burn_in)
+        eff_inner_thin = (20 if is_ode else 12) if inner_thin is None else int(inner_thin)
         eff_n_sir = (4096 if is_ode else 50) if n_sir is None else int(n_sir)
 
         if is_ode:
@@ -776,11 +775,7 @@ class LotkaVolterra(DynamicalSimulator):
         else:
             x_jax = self._format_trajectory_obs(x_obs)
 
-        rng_key = (
-            jax.random.PRNGKey(self.seed)
-            if (is_default_obs and self._default_x_obs is not None)
-            else self._next_rng_key()
-        )
+        rng_key = self._next_rng_key()
         num_samples_per_chain = math.ceil(num_samples / eff_n_chains)
         eff_step_size = (
             self.default_step_size if step_size is None else float(step_size)
@@ -809,5 +804,6 @@ class LotkaVolterra(DynamicalSimulator):
                 n_particles=n_particles,
                 step_size=eff_step_size,
                 n_sir=eff_n_sir,
+                adapt_warmup=adapt_warmup,
             )
         return self._finalize_mcmc_samples(samples_jax, num_samples)

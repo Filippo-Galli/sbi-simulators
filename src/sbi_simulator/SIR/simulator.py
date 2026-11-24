@@ -659,9 +659,9 @@ class SIR(DynamicalSimulator):
                 )[0].T
 
         is_ode = self.mode == "ode"
-        eff_n_chains = (32 if is_ode else 20) if n_chains is None else int(n_chains)
-        eff_burn_in = (500 if is_ode else 200) if burn_in is None else int(burn_in)
-        eff_inner_thin = (8 if is_ode else 4) if inner_thin is None else int(inner_thin)
+        eff_n_chains = (40 if is_ode else 32) if n_chains is None else int(n_chains)
+        eff_burn_in = (600 if is_ode else 120) if burn_in is None else int(burn_in)
+        eff_inner_thin = (20 if is_ode else 12) if inner_thin is None else int(inner_thin)
         eff_n_sir = (4096 if is_ode else 50) if n_sir is None else int(n_sir)
 
         if is_ode:
@@ -698,5 +698,6 @@ class SIR(DynamicalSimulator):
                 n_particles=n_particles,
                 step_size=eff_step_size,
                 n_sir=eff_n_sir,
+                adapt_warmup=adapt_warmup,
             )
         return self._finalize_mcmc_samples(samples_jax, num_samples)
