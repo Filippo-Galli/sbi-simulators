@@ -15,6 +15,7 @@ from ..mcmc import (
     build_batched_ll,
     build_gibbs_pmmh_sampler,
     build_jax_trajectory_solver,
+    build_mh_mcmc_sampler,
     build_particle_filter_ll,
 )
 from ..priors import NormalPrior
@@ -53,6 +54,98 @@ def _default_double_well_u0(dim: int) -> tuple[float, ...]:
     return tuple(([-0.5, 0.5] * ((dim + 1) // 2))[:dim])
 
 
+def _build_double_well_factorized_pf_ll(
+    dt: float,
+    inner_steps: int,
+    dim: int,
+    obs_sigma: float,
+):
+    """Build a factorized 1D Bootstrap PF log-likelihood over ``dim`` independent coords."""
+    step_1d = _build_double_well_step_fn(dt=dt, inner_steps=inner_steps, dim=1)
+    pf_1d = build_particle_filter_ll(step_1d, obs_dim=1, obs_sigma=obs_sigma)
+
+    def factorized_pf_ll(theta, x_obs, key, n_particles: int = 150):
+        # x_obs has shape (num_steps, dim) -> (dim, num_steps, 1)
+        x_per_dim = x_obs.T[:, :, None]
+        keys = jax.random.split(key, dim)
+        lls = jax.vmap(lambda xd, k: pf_1d(theta, xd, k, n_particles=n_particles))(
+            x_per_dim, keys
+        )
+        total = jnp.sum(lls)
+        return jnp.where(jnp.isfinite(total), total, -jnp.inf)
+
+    return jax.jit(factorized_pf_ll, static_argnames=["n_particles"])
+
+
+def _build_double_well_bridge_ll(
+    dt: float,
+    inner_steps: int,
+    n_bridges: int = 64,
+):
+    """Build deterministic 1D Brownian-bridge log-likelihood for noiseless trajectories."""
+    k_steps = int(inner_steps)
+    total_var = k_steps * dt
+    log_norm_bm = -0.5 * jnp.log(2.0 * jnp.pi * total_var)
+    log_n = jnp.log(float(n_bridges))
+    # Antithetic standard normal draws shared across transitions for ultra-low variance
+    half_b = max(n_bridges // 2, 1)
+    base_key = jax.random.PRNGKey(20250101)
+
+    def bridge_transition_ll(x_start, x_end, theta, z_draws):
+        theta1 = jnp.exp(0.5 * theta[0])
+        theta2 = -jnp.exp(0.5 * theta[1])
+
+        if k_steps == 1:
+            mu = theta1 * x_start + theta2 * (x_start**3)
+            mean = x_start + mu * dt
+            return -0.5 * ((x_end - mean) ** 2) / dt - 0.5 * jnp.log(2.0 * jnp.pi * dt)
+
+        log_bm = -0.5 * ((x_end - x_start) ** 2) / total_var + log_norm_bm
+
+        def one_bridge(z_seq):
+            def body(carry, inp):
+                z, log_radon = carry
+                k_idx, eps = inp
+                rem = k_steps - k_idx
+                mean_q = z + (x_end - z) / rem
+                std_q = jnp.sqrt(dt * (rem - 1.0) / rem)
+                z_next = mean_q + std_q * eps
+                mu = theta1 * z + theta2 * (z**3)
+                dz = z_next - z
+                lr = mu * dz - 0.5 * (mu**2) * dt
+                return (z_next, log_radon + lr), None
+
+            (z_last, log_radon), _ = jax.lax.scan(
+                body, (x_start, 0.0), (jnp.arange(k_steps - 1), z_seq)
+            )
+            mu_last = theta1 * z_last + theta2 * (z_last**3)
+            dz_last = x_end - z_last
+            return log_radon + (mu_last * dz_last - 0.5 * (mu_last**2) * dt)
+
+        lrs = jax.vmap(one_bridge)(z_draws)
+        lrs = jnp.where(jnp.isfinite(lrs), lrs, -jnp.inf)
+        return log_bm + jax.scipy.special.logsumexp(lrs) - log_n
+
+    def noiseless_ll(theta, x_obs):
+        starts = x_obs[:-1].reshape(-1)
+        ends = x_obs[1:].reshape(-1)
+        n_trans = starts.shape[0]
+        if k_steps == 1:
+            z_all = jnp.zeros((n_trans, 1, 1), dtype=jnp.float32)
+        else:
+            z_half = jax.random.normal(
+                base_key, shape=(n_trans, half_b, k_steps - 1), dtype=jnp.float32
+            )
+            z_all = jnp.concatenate([z_half, -z_half], axis=1)[:, :n_bridges, :]
+        lls = jax.vmap(
+            lambda s, e, zd: bridge_transition_ll(s, e, theta, zd)
+        )(starts, ends, z_all)
+        total = jnp.sum(lls)
+        return jnp.where(jnp.isfinite(total), total, -jnp.inf)
+
+    return jax.jit(noiseless_ll)
+
+
 @functools.lru_cache(maxsize=32)
 def _get_double_well_jax_bundle(
     dt: float,
@@ -60,8 +153,9 @@ def _get_double_well_jax_bundle(
     dim: int,
     num_steps: int,
     obs_sigma: float,
+    use_noiseless_ll: bool = False,
 ):
-    """Build and cache compiled JAX solver, particle filter, and Gibbs PMMH sampler."""
+    """Build and cache compiled JAX solver, likelihood, and MCMC/PMMH sampler."""
     step_fn = _build_double_well_step_fn(dt=dt, inner_steps=inner_steps, dim=dim)
     solve_batch, _ = build_jax_trajectory_solver(
         step_fn,
@@ -69,7 +163,23 @@ def _get_double_well_jax_bundle(
         default_x0=_default_double_well_u0(dim),
         clip_non_negative=False,
     )
-    pf_ll_fn = build_particle_filter_ll(step_fn, obs_dim=dim, obs_sigma=obs_sigma)
+    if use_noiseless_ll:
+        ll_fn = _build_double_well_bridge_ll(dt=dt, inner_steps=inner_steps)
+        v_ll_fn = build_batched_ll(ll_fn, stochastic=False)
+        jax_mcmc = build_mh_mcmc_sampler(
+            ll_fn,
+            prior=NormalPrior.isotropic(2),
+            init_strategy="sir_pool",
+            rescue_stuck_chains=True,
+        )
+        return solve_batch, v_ll_fn, jax_mcmc
+
+    pf_ll_fn = _build_double_well_factorized_pf_ll(
+        dt=dt,
+        inner_steps=inner_steps,
+        dim=dim,
+        obs_sigma=obs_sigma,
+    )
     v_pf_ll_fn = build_batched_ll(pf_ll_fn, stochastic=True)
     jax_mcmc = build_gibbs_pmmh_sampler(pf_ll_fn, NormalPrior.isotropic(2))
     return solve_batch, v_pf_ll_fn, jax_mcmc
@@ -146,6 +256,7 @@ class DoubleWell(DynamicalSimulator):
 
         self.prior_spec = NormalPrior.isotropic(dim_parameters)
         self.prior_dist = self.prior_spec.to_pyro()
+        self._use_noiseless_ll = self.summary is None
 
         self._jax_solver_batch, self._v_pf_ll_fn, self._jax_mcmc = (
             _get_double_well_jax_bundle(
@@ -154,6 +265,7 @@ class DoubleWell(DynamicalSimulator):
                 self.D,
                 self.num_steps,
                 self.obs_sigma,
+                self._use_noiseless_ll,
             )
         )
 
@@ -204,13 +316,21 @@ class DoubleWell(DynamicalSimulator):
         x_obs: torch.Tensor | np.ndarray,
         n_particles: int = 150,
     ) -> torch.Tensor:
-        """Evaluate marginal log-likelihood ``log p(y_{1:T} | theta)`` via particle filter."""
+        """Evaluate marginal log-likelihood ``log p(y_{1:T} | theta)``.
+
+        Uses exact 1D Brownian-bridge importance sampling when ``summary is None``
+        (noiseless trajectories), and a factorized 1D bootstrap particle filter when
+        observation noise ``obs_sigma`` is present (e.g. ``summary="subsample"``).
+        """
         params, _ = self._prepare_parameters(parameters)
         x_jax = self._format_trajectory_obs(x_obs)
         params_jax = jnp.asarray(params.detach().cpu().numpy(), dtype=jnp.float32)
 
-        keys = jax.random.split(self._next_rng_key(), params.shape[0])
-        lls_jax = self._v_pf_ll_fn(params_jax, x_jax, keys, n_particles=n_particles)
+        if self._use_noiseless_ll:
+            lls_jax = self._v_pf_ll_fn(params_jax, x_jax)
+        else:
+            keys = jax.random.split(self._next_rng_key(), params.shape[0])
+            lls_jax = self._v_pf_ll_fn(params_jax, x_jax, keys, n_particles=n_particles)
         return torch.from_numpy(np.array(lls_jax, copy=True))
 
     @override
@@ -218,14 +338,16 @@ class DoubleWell(DynamicalSimulator):
         self,
         x_obs: torch.Tensor | np.ndarray | None = None,
         num_samples: int = 1000,
-        n_chains: int = 20,
-        burn_in: int = 200,
-        inner_thin: int = 4,
+        n_chains: int | None = None,
+        burn_in: int | None = None,
+        inner_thin: int | None = None,
         n_particles: int = 150,
-        step_size: float = 0.2,
+        step_size: float | None = None,
+        n_sir: int | None = None,
+        adapt_warmup: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        """Sample from ``p(theta | y_{1:T})`` using JAX Gibbs PMMH."""
+        """Sample from ``p(theta | y_{1:T})`` via JAX MH MCMC (noiseless) or factorized 1D PMMH."""
         if x_obs is None:
             # Default observation generated from theta = [0.0, 0.0] with seed 42
             x_obs = torch.tensor(
@@ -246,16 +368,45 @@ class DoubleWell(DynamicalSimulator):
             )
 
         x_obs_jax = self._format_trajectory_obs(x_obs)
-        num_samples_per_chain = math.ceil(num_samples / n_chains)
+
+        if self._use_noiseless_ll:
+            eff_n_chains = 40 if n_chains is None else int(n_chains)
+            eff_burn_in = 400 if burn_in is None else int(burn_in)
+            eff_inner_thin = 20 if inner_thin is None else int(inner_thin)
+            eff_step_size = 0.2 if step_size is None else float(step_size)
+            eff_n_sir = 512 if n_sir is None else int(n_sir)
+            num_samples_per_chain = math.ceil(num_samples / eff_n_chains)
+
+            samples_jax = self._jax_mcmc(
+                x_obs_jax,
+                self._next_rng_key(),
+                n_chains=eff_n_chains,
+                num_samples_per_chain=num_samples_per_chain,
+                burn_in=eff_burn_in,
+                inner_thin=eff_inner_thin,
+                step_size=eff_step_size,
+                n_sir=eff_n_sir,
+                adapt_warmup=adapt_warmup,
+            )
+            return self._finalize_mcmc_samples(samples_jax, num_samples)
+
+        eff_n_chains = 32 if n_chains is None else int(n_chains)
+        eff_burn_in = 120 if burn_in is None else int(burn_in)
+        eff_inner_thin = 10 if inner_thin is None else int(inner_thin)
+        eff_step_size = 0.35 if step_size is None else float(step_size)
+        eff_n_sir = 50 if n_sir is None else int(n_sir)
+        num_samples_per_chain = math.ceil(num_samples / eff_n_chains)
 
         samples_jax = self._jax_mcmc(
             x_obs=x_obs_jax,
             rng_key=self._next_rng_key(),
-            n_chains=n_chains,
+            n_chains=eff_n_chains,
             num_samples_per_chain=num_samples_per_chain,
-            burn_in=burn_in,
-            inner_thin=inner_thin,
+            burn_in=eff_burn_in,
+            inner_thin=eff_inner_thin,
             n_particles=n_particles,
-            step_size=step_size,
+            step_size=eff_step_size,
+            n_sir=eff_n_sir,
+            adapt_warmup=adapt_warmup,
         )
         return self._finalize_mcmc_samples(samples_jax, num_samples)
