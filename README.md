@@ -10,6 +10,7 @@ A Python library of benchmark simulation models for Simulation-Based Inference (
   - `DoubleWell`
   - `GaussianGaussian`
   - `LinearSDE`
+  - `Lorenz63`
   - `LotkaVolterra`
   - `SIR`
   - `SLCP`
