@@ -134,14 +134,71 @@ def _get_inference(
 
 
 class Lorenz63(DynamicalSimulator):
-    """Lorenz63 with parameters ``(log(r), log(b), log(sigma))`` and state ``(x, y, z)``.
+    r"""Lorenz63 with parameters ``(log(r), log(b), log(sigma))`` and state ``(x, y, z)``.
 
-    Each observation advances the ODE by ``dt * inner_steps`` using RK4.
-    The first observation is the initial state after ``spinup_steps`` observation
-    intervals. The default output is a deterministic, state-major trajectory.
-    ``summary="subsample"`` adds Gaussian observation noise, ``summary="stats"``
-    returns 12 trajectory statistics, and ``summary="two_step"`` returns a
-    flattened transition pair in time order.
+    The log parameters have independent Normal priors. The ODE uses their
+    exponentials as the physical parameters ``(r, b, sigma)``.
+
+    Reference
+    ---------
+    Lorenz, E. N. (1963). Deterministic Nonperiodic Flow.
+    Journal of the Atmospheric Sciences, 20(2), 130–141.
+    https://doi.org/10.1175/1520-0469%281963%29020%3C0130%3ADNF%3E2.0.CO%3B2
+
+    Parameters
+    ----------
+    dim_parameters : int, optional
+        Number of log parameters. Must be 3.
+    seed : int, optional
+        Random seed. Defaults to 42.
+    dt : float, optional
+        RK4 integration step size. Defaults to 0.001.
+    inner_steps : int, optional
+        RK4 steps per observation interval. Defaults to 20, so consecutive
+        observations are separated by ``dt * inner_steps`` time units.
+    num_steps : int, optional
+        Number of recorded states, including the first state after spin-up.
+        Defaults to 11.
+    spinup_steps : int, optional
+        Number of observation intervals to integrate before recording the
+        first state. Defaults to 0.
+    u0 : torch.Tensor, numpy.ndarray, or tuple of float, optional
+        Initial state before spin-up. Defaults to ``(1.0, 1.0, 1.0)``.
+    prior_mean : torch.Tensor, numpy.ndarray, tuple of float, or None, optional
+        Means in log-parameter order. ``None`` uses ``log([28, 8/3, 10])``.
+    prior_std : torch.Tensor, numpy.ndarray, tuple of float, or None, optional
+        Standard deviations in log-parameter order. ``None`` uses
+        ``(0.35, 0.25, 0.25)``.
+    obs_sigma : float, optional
+        Positive standard deviation of the Gaussian observation model.
+        Defaults to 0.05.
+    summary : str or None, optional
+        ``None`` (the default) returns a deterministic trajectory flattened in
+        state-major order. ``"subsample"`` adds independent Gaussian noise to
+        each entry. ``"stats"`` and ``"summary_stats"`` return the mean,
+        log-variance, and lag-1 and lag-2 autocorrelations for each coordinate.
+        ``"two_step"`` returns a flattened transition pair in time order and
+        requires ``num_steps >= 2``.
+    **kwargs
+        Additional options forwarded to the base simulator.
+
+    Likelihood
+    ----------
+    ``log_likelihood()`` and ``posterior_samples()`` use independent Gaussian
+    errors around the model prediction ``g(theta)`` with standard deviation
+    ``obs_sigma``.
+
+    .. math::
+        y_{\mathrm{obs}} \mid \theta \sim
+        \mathcal{N}(g(\theta), \mathrm{obs\_sigma}^2 I)
+
+    For trajectories, the prediction comes from integrating the ODE from
+    ``u0`` with the configured spin-up. For summary statistics, the prediction
+    is computed from that trajectory. For transition pairs, the likelihood
+    conditions on the observed first state and uses one observation interval
+    of integration to predict the second state. The Gaussian model is used
+    for reference inference even when ``simulate()`` produces deterministic
+    outputs.
     """
 
     def __init__(
