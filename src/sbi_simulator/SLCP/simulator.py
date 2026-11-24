@@ -309,9 +309,9 @@ class SLCP(Simulator):
         self,
         x_obs: torch.Tensor | np.ndarray | None = None,
         num_samples: int = 1000,
-        n_chains: int = 20,
+        n_chains: int = 64,
         burn_in: int = 500,
-        thin: int = 4,
+        thin: int = 20,
         step_size: float = 0.08,
         n_sir: int = 5000,
         adapt_warmup: bool = True,
@@ -355,5 +355,11 @@ class SLCP(Simulator):
         )
 
         samples_np = np.array(samples_jax, copy=True)
+        # Exploit exact likelihood & prior sign symmetry in (theta_2, theta_3)
+        signs = self._np_rng.choice(
+            np.array([-1.0, 1.0], dtype=samples_np.dtype),
+            size=(samples_np.shape[0], 2),
+        )
+        samples_np[:, 2:4] *= signs
         self._np_rng.shuffle(samples_np)
         return torch.from_numpy(samples_np[:num_samples])
