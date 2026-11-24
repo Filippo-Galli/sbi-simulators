@@ -183,6 +183,7 @@ def build_gibbs_pmmh_sampler(
             "inner_thin",
             "n_particles",
             "n_sir",
+            "adapt_warmup",
         ],
     )
     def run_mcmc(
@@ -195,8 +196,9 @@ def build_gibbs_pmmh_sampler(
         n_particles: int = 150,
         step_size: float = 0.1,
         n_sir: int = 50,
+        adapt_warmup: bool = True,
     ):
-        k_init, k_mcmc = jax.random.split(rng_key)
+        k_init, k_warm, k_samp = jax.random.split(rng_key, 3)
 
         def init_single_chain(k):
             k1, k2, k3 = jax.random.split(k, 3)
@@ -213,41 +215,88 @@ def build_gibbs_pmmh_sampler(
         init_keys = jax.random.split(k_init, n_chains)
         curr_thetas, curr_pf_keys, curr_lp = jax.vmap(init_single_chain)(init_keys)
 
-        def scan_step(state, subkey):
+        def pmmh_block(state, log_scale, subkey, n_theta_steps: int):
             k_scan_th, k_key, k_acc_k = jax.random.split(subkey, 3)
-            keys_th = jax.random.split(k_scan_th, inner_thin)
+            keys_th = jax.random.split(k_scan_th, n_theta_steps)
+            scale = jnp.exp(log_scale)[:, None]
 
             def theta_step(carry, subkey_th):
-                th, k_pf, lp = carry
+                th, k_pf, lp, acc_sum = carry
                 k_p, k_a = jax.random.split(subkey_th)
-                prop_th = th + jax.random.normal(k_p, shape=th.shape) * step_size
+                prop_th = th + jax.random.normal(k_p, shape=th.shape) * scale
                 prop_lp = v_log_joint(prop_th, x_obs, k_pf, n_particles)
                 log_u = jnp.log(jax.random.uniform(k_a, shape=(n_chains,)))
                 acc = jnp.isfinite(prop_lp) & (log_u < prop_lp - lp)
                 new_th = jnp.where(acc[:, None], prop_th, th)
                 new_lp = jnp.where(acc, prop_lp, lp)
-                return (new_th, k_pf, new_lp), None
+                return (new_th, k_pf, new_lp, acc_sum + acc.astype(jnp.float32)), None
 
-            (curr_thetas, curr_pf_keys, curr_lp), _ = jax.lax.scan(
-                theta_step, state, keys_th
+            th0, pf0, lp0 = state
+            (new_thetas, new_pf_keys, new_lp, acc_sum), _ = jax.lax.scan(
+                theta_step,
+                (th0, pf0, lp0, jnp.zeros((n_chains,), dtype=jnp.float32)),
+                keys_th,
             )
 
             # 1 step on particle filter key
             prop_pf_keys = jax.random.split(k_key, n_chains)
-            prop_lp_key = v_log_joint(curr_thetas, x_obs, prop_pf_keys, n_particles)
+            prop_lp_key = v_log_joint(new_thetas, x_obs, prop_pf_keys, n_particles)
             log_u_key = jnp.log(jax.random.uniform(k_acc_k, shape=(n_chains,)))
-            acc_key = jnp.isfinite(prop_lp_key) & (log_u_key < prop_lp_key - curr_lp)
-            curr_pf_keys = jnp.where(acc_key[:, None], prop_pf_keys, curr_pf_keys)
-            curr_lp = jnp.where(acc_key, prop_lp_key, curr_lp)
+            acc_key = jnp.isfinite(prop_lp_key) & (log_u_key < prop_lp_key - new_lp)
+            new_pf_keys = jnp.where(acc_key[:, None], prop_pf_keys, new_pf_keys)
+            new_lp = jnp.where(acc_key, prop_lp_key, new_lp)
 
-            return (curr_thetas, curr_pf_keys, curr_lp), curr_thetas
+            return (new_thetas, new_pf_keys, new_lp), acc_sum / float(n_theta_steps)
 
-        total_steps = burn_in + num_samples_per_chain
-        keys = jax.random.split(k_mcmc, total_steps)
-        _, all_samples = jax.lax.scan(
-            scan_step, (curr_thetas, curr_pf_keys, curr_lp), keys
+        curr_ls = jnp.full(
+            (n_chains,),
+            jnp.log(jnp.maximum(jnp.asarray(step_size, dtype=jnp.float32), 1e-5)),
+            dtype=jnp.float32,
         )
-        post_burnin = prior.from_unconstrained(all_samples[burn_in:])
+        warm_thin = min(inner_thin, 2)
+
+        if burn_in > 0 and adapt_warmup:
+            target_acc = 0.30 if dim_parameters > 1 else 0.44
+            min_ls = jnp.log(1e-5)
+            max_ls = jnp.log(5.0)
+
+            def warmup_step(carry, inputs):
+                th, k_pf, lp, ls = carry
+                step_idx, subkey = inputs
+                (th, k_pf, lp), acc_rate = pmmh_block(
+                    (th, k_pf, lp), ls, subkey, warm_thin
+                )
+                gamma = (step_idx.astype(jnp.float32) + 10.0) ** (-0.6)
+                ls = jnp.clip(ls + gamma * (acc_rate - target_acc), min_ls, max_ls)
+                return (th, k_pf, lp, ls), None
+
+            warm_keys = jax.random.split(k_warm, burn_in)
+            (curr_thetas, curr_pf_keys, curr_lp, curr_ls), _ = jax.lax.scan(
+                warmup_step,
+                (curr_thetas, curr_pf_keys, curr_lp, curr_ls),
+                (jnp.arange(burn_in), warm_keys),
+            )
+        elif burn_in > 0:
+            warm_keys = jax.random.split(k_warm, burn_in)
+
+            def fixed_warm_step(state, subkey):
+                new_state, _ = pmmh_block(state, curr_ls, subkey, warm_thin)
+                return new_state, None
+
+            (curr_thetas, curr_pf_keys, curr_lp), _ = jax.lax.scan(
+                fixed_warm_step, (curr_thetas, curr_pf_keys, curr_lp), warm_keys
+            )
+
+        # Frozen sampling phase (exact detailed balance per chain)
+        def sample_step(state, subkey):
+            new_state, _ = pmmh_block(state, curr_ls, subkey, inner_thin)
+            return new_state, new_state[0]
+
+        samp_keys = jax.random.split(k_samp, num_samples_per_chain)
+        _, all_samples = jax.lax.scan(
+            sample_step, (curr_thetas, curr_pf_keys, curr_lp), samp_keys
+        )
+        post_burnin = prior.from_unconstrained(all_samples)
         return post_burnin.transpose(1, 0, 2).reshape(-1, dim_parameters)
 
     return run_mcmc
@@ -419,8 +468,8 @@ def build_mh_mcmc_sampler(
             init_keys = jax.random.split(k_init, n_chains)
             curr_thetas, curr_lp = jax.vmap(init_single_chain)(init_keys)
 
-        def mh_block(th, lp, log_scale, chol, subkey):
-            keys_th = jax.random.split(subkey, inner_thin)
+        def mh_block(th, lp, log_scale, chol, subkey, n_steps: int):
+            keys_th = jax.random.split(subkey, n_steps)
             scale = jnp.exp(log_scale)[:, None]
 
             def theta_step(carry, subkey_th):
@@ -441,7 +490,7 @@ def build_mh_mcmc_sampler(
                 (th, lp, jnp.zeros((n_chains,), dtype=jnp.float32)),
                 keys_th,
             )
-            return new_th, new_lp, acc_sum / float(inner_thin)
+            return new_th, new_lp, acc_sum / float(n_steps)
 
         init_log_scale = jnp.full(
             (n_chains,),
@@ -450,6 +499,7 @@ def build_mh_mcmc_sampler(
         )
         curr_ls = init_log_scale
         curr_chol = jnp.broadcast_to(eye_d, (n_chains, dim_parameters, dim_parameters))
+        warm_thin = min(inner_thin, 4)
 
         if burn_in > 0 and adapt_warmup:
             target_acc = 0.234 if dim_parameters > 1 else 0.44
@@ -466,7 +516,7 @@ def build_mh_mcmc_sampler(
                 step_idx, subkey = inputs
                 k_mh, k_res = jax.random.split(subkey)
 
-                th, lp, acc_rate = mh_block(th, lp, ls, chol, k_mh)
+                th, lp, acc_rate = mh_block(th, lp, ls, chol, k_mh, warm_thin)
                 gamma = (step_idx.astype(jnp.float32) + 10.0) ** (-0.6)
                 ls = jnp.clip(ls + gamma * (acc_rate - target_acc), min_ls, max_ls)
 
@@ -569,7 +619,7 @@ def build_mh_mcmc_sampler(
 
             def fixed_warm_step(state, subkey):
                 th, lp = state
-                new_th, new_lp, _ = mh_block(th, lp, curr_ls, curr_chol, subkey)
+                new_th, new_lp, _ = mh_block(th, lp, curr_ls, curr_chol, subkey, warm_thin)
                 return (new_th, new_lp), None
 
             (curr_thetas, curr_lp), _ = jax.lax.scan(
@@ -579,7 +629,7 @@ def build_mh_mcmc_sampler(
         # Frozen sampling phase (exact detailed balance per chain)
         def sample_step(state, subkey):
             th, lp = state
-            new_th, new_lp, _ = mh_block(th, lp, curr_ls, curr_chol, subkey)
+            new_th, new_lp, _ = mh_block(th, lp, curr_ls, curr_chol, subkey, inner_thin)
             return (new_th, new_lp), new_th
 
         samp_keys = jax.random.split(k_samp, num_samples_per_chain)
