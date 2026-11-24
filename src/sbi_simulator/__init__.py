@@ -35,7 +35,7 @@ from .UniformGaussian import (
 try:
     __version__ = version("sbi-simulator")
 except PackageNotFoundError:
-    __version__ = "0.3.1"
+    __version__ = "0.3.2"
 
 SIMULATORS = {
     "AR1": AR1,

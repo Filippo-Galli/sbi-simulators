@@ -13,7 +13,7 @@
 }:
 buildPythonPackage (finalAttrs: {
   pname = "sbi-simulator";
-  version = "0.3.1";
+  version = "0.3.2";
   pyproject = true;
 
   src = lib.fileset.toSource {
